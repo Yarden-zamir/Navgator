@@ -7,3 +7,7 @@ edition = "2021"
 ratatui = "0.30"
 crossterm = "0.29"
 ansi-to-tui = "8.0"
+tui-input = { version = "0.15", features = ["crossterm"] }
+libc = "0.2"
+figment = { version = "0.10", features = ["toml"] }
+serde = { version = "1.0", features = ["derive"] }

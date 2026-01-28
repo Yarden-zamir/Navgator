@@ -7,6 +7,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use figment::providers::{Format, Toml};
+use figment::Figment;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -15,19 +17,21 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
+use serde::Deserialize;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     env,
     error::Error,
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
+use tui_input::backend::crossterm::EventHandler;
+use tui_input::{Input, InputRequest};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
@@ -61,6 +65,25 @@ struct MetaResult {
 struct TagResult {
     path: String,
     tags: Vec<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    paths: Option<ConfigPaths>,
+}
+
+#[derive(Default, Deserialize)]
+struct ConfigPaths {
+    #[serde(default)]
+    index_folders: Vec<String>,
+    #[serde(default)]
+    static_items: Vec<String>,
+}
+
+struct LoadedConfig {
+    index_folders: Vec<PathBuf>,
+    static_items: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,15 +138,14 @@ enum Focus {
     Search,
     Preview,
     Git,
+    TagEdit,
 }
 
 fn main() -> AppResult<()> {
+    ensure_tty_stdin()?;
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "navigate" {
         return run_navigate();
-    }
-    if args[0] == "context" {
-        return run_context(&args[1..]);
     }
     if args[0] == "--help" || args[0] == "-h" {
         print_usage();
@@ -135,120 +157,52 @@ fn main() -> AppResult<()> {
     std::process::exit(2);
 }
 
+fn ensure_tty_stdin() -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::io::IsTerminal;
+        use std::os::unix::io::AsRawFd;
+
+        if io::stdin().is_terminal() {
+            return Ok(());
+        }
+
+        let tty = fs::File::open("/dev/tty")?;
+        let result = unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO) };
+        if result == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
 fn print_usage() {
-    eprintln!(
-        "Usage:\n  navgator [navigate]\n  navgator context <name> [--create|--no-create] [--template <template>] [--description <desc>]"
-    );
+    eprintln!("Usage:\n  navgator [navigate]");
 }
 
 fn run_navigate() -> AppResult<()> {
     let items = build_items()?;
     match select_from_list("Navigate", &items)? {
-        Some(choice) => {
-            println!("{}", choice);
-            Ok(())
-        }
+        Some(choice) => write_selection(&choice),
         None => std::process::exit(1),
     }
 }
 
-fn run_context(args: &[String]) -> AppResult<()> {
-    let mut name: Option<String> = None;
-    let mut create: Option<bool> = None;
-    let mut template: Option<String> = None;
-    let mut description: Option<String> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--create" => {
-                create = Some(true);
-                i += 1;
-            }
-            "--no-create" => {
-                create = Some(false);
-                i += 1;
-            }
-            "--template" => {
-                let value = args.get(i + 1).ok_or("Missing value for --template")?;
-                template = Some(value.clone());
-                i += 2;
-            }
-            "--description" => {
-                let value = args.get(i + 1).ok_or("Missing value for --description")?;
-                description = Some(value.clone());
-                i += 2;
-            }
-            "--help" | "-h" => {
-                print_usage();
-                return Ok(());
-            }
-            other => {
-                if name.is_none() {
-                    name = Some(other.to_string());
-                    i += 1;
-                } else {
-                    return Err(format!("Unexpected argument: {}", other).into());
-                }
-            }
+fn write_selection(path: &str) -> AppResult<()> {
+    if let Ok(output_path) = env::var("NAVGATOR_OUTPUT") {
+        if !output_path.is_empty() {
+            fs::write(output_path, path)?;
+            return Ok(());
         }
     }
-
-    let name = name.ok_or("Context name is required")?;
-    let items = build_items()?;
-    if let Some(found) = items.iter().find(|item| item.ends_with(&name)) {
-        println!("{}", found);
-        return Ok(());
-    }
-
-    let create_repo = match create {
-        Some(value) => value,
-        None => {
-            let choices = vec!["Yes!".to_string(), "No".to_string()];
-            match select_from_list("Create GH repo?", &choices)? {
-                Some(choice) => choice == "Yes!",
-                None => std::process::exit(1),
-            }
-        }
-    };
-
-    let home = home_dir()?;
-    let base_dir = index_folders(&home)
-        .get(0)
-        .cloned()
-        .ok_or("No index folders configured")?;
-    fs::create_dir_all(&base_dir)?;
-    let target_dir = base_dir.join(&name);
-
-    if create_repo {
-        let template = match template {
-            Some(value) => value,
-            None => {
-                let list = templates();
-                match select_from_list("Select a template", &list)? {
-                    Some(choice) => choice,
-                    None => std::process::exit(1),
-                }
-            }
-        };
-        let description = description.unwrap_or_else(|| name.clone());
-        run_gh_create(&base_dir, &name, &template, &description)?;
-    } else {
-        fs::create_dir_all(&target_dir)?;
-    }
-
-    if target_dir.join(".envrc").is_file() {
-        run_direnv_allow(&target_dir)?;
-    }
-
-    println!("{}", target_dir.display());
+    println!("{}", path);
     Ok(())
 }
 
 fn build_items() -> AppResult<Vec<String>> {
-    let home = home_dir()?;
-    let mut items: Vec<PathBuf> = static_items(&home);
-    let index_folders = index_folders(&home);
+    let config = load_config()?;
+    let mut items: Vec<PathBuf> = config.static_items;
+    let index_folders = config.index_folders;
 
     for folder in index_folders {
         items.push(folder.clone());
@@ -265,10 +219,15 @@ fn build_items() -> AppResult<Vec<String>> {
         items.extend(children);
     }
 
-    Ok(items
-        .into_iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect())
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in items {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key.clone()) {
+            out.push(key);
+        }
+    }
+    Ok(out)
 }
 
 fn home_dir() -> AppResult<PathBuf> {
@@ -276,35 +235,119 @@ fn home_dir() -> AppResult<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
-fn index_folders(home: &Path) -> Vec<PathBuf> {
-    vec![home.join("Github"), home.join("Desktop")]
+fn load_config() -> AppResult<LoadedConfig> {
+    let home = home_dir()?;
+    let mut index_folders = Vec::new();
+    let mut static_items = Vec::new();
+    let mut seen_index = HashSet::new();
+    let mut seen_static = HashSet::new();
+    let mut found_config = false;
+
+    for path in config_paths(&home) {
+        if !path.is_file() {
+            continue;
+        }
+        found_config = true;
+        let base_dir = path.parent().unwrap_or(&home);
+        let config: ConfigFile = Figment::from(Toml::file(&path))
+            .extract()
+            .map_err(|err| format!("Failed to parse config {}: {}", path.display(), err))?;
+        if let Some(paths) = config.paths {
+            merge_paths(
+                &paths.index_folders,
+                base_dir,
+                &home,
+                &mut index_folders,
+                &mut seen_index,
+            );
+            merge_paths(
+                &paths.static_items,
+                base_dir,
+                &home,
+                &mut static_items,
+                &mut seen_static,
+            );
+        }
+    }
+
+    if !found_config {
+        return Err("No navgator config found. Create one in ~/.config/navgator/config.toml (or set $NAVGATOR_CONFIG).".into());
+    }
+
+    Ok(LoadedConfig {
+        index_folders,
+        static_items,
+    })
 }
 
-fn static_items(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join("Desktop"),
-        PathBuf::from("/opt/homebrew"),
-        home.join("Downloads"),
-        home.join("Library")
-            .join("Application Support")
-            .join("ModrinthApp")
-            .join("profiles")
-            .join("Create-Prepare-to-Dye"),
-        home.join("Library")
-            .join("Application Support")
-            .join("ModrinthApp")
-            .join("profiles")
-            .join("Create ptd 2"),
-    ]
+fn config_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = env::var("NAVGATOR_CONFIG") {
+        if !path.trim().is_empty() {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    paths.push(PathBuf::from("/etc/navgator/config.toml"));
+    let xdg = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".config"));
+    paths.push(xdg.join("navgator/config.toml"));
+    paths.push(home.join(".config/navgator/config.toml"));
+    paths.push(home.join(".navgator.toml"));
+    if let Ok(cwd) = env::current_dir() {
+        paths.push(cwd.join(".navgator.toml"));
+        paths.push(cwd.join(".navgator/config.toml"));
+    }
+
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            unique.push(path);
+        }
+    }
+    unique
 }
 
-fn templates() -> Vec<String> {
-    vec![
-        "yarden-zamir/python-template".to_string(),
-        "yarden-zamir/dotnet-template".to_string(),
-        "qlik-trial/dotnet-service".to_string(),
-        "Computer-Engineering-Major-Ort-Ariel/WebTemplate".to_string(),
-    ]
+fn merge_paths(
+    raw_paths: &[String],
+    base_dir: &Path,
+    home: &Path,
+    target: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+) {
+    for raw in raw_paths {
+        if let Some(path) = normalize_path(raw, base_dir, home) {
+            let key = path.to_string_lossy().to_string();
+            if seen.insert(key) {
+                target.push(path);
+            }
+        }
+    }
+}
+
+fn normalize_path(raw: &str, base_dir: &Path, home: &Path) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut value = trimmed.to_string();
+    if value.starts_with("~/") {
+        value = value.replacen("~", &home.to_string_lossy(), 1);
+    }
+    if value.contains("$HOME") {
+        value = value.replace("$HOME", &home.to_string_lossy());
+    }
+    let mut path = PathBuf::from(value);
+    if path.is_relative() {
+        path = base_dir.join(path);
+    }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn is_dir(path: &Path) -> bool {
@@ -313,63 +356,13 @@ fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn run_gh_create(base_dir: &Path, name: &str, template: &str, description: &str) -> AppResult<()> {
-    let output = Command::new("gh")
-        .args([
-            "repo",
-            "create",
-            name,
-            "--clone",
-            "--description",
-            description,
-            "--disable-wiki",
-            "--public",
-            "--template",
-            template,
-        ])
-        .current_dir(base_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    let mut stderr = io::stderr();
-    stderr.write_all(&output.stdout)?;
-    stderr.write_all(&output.stderr)?;
-    stderr.flush()?;
-
-    if !output.status.success() {
-        return Err("gh repo create failed".into());
-    }
-    Ok(())
-}
-
-fn run_direnv_allow(target_dir: &Path) -> AppResult<()> {
-    let output = Command::new("direnv")
-        .arg("allow")
-        .current_dir(target_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    let mut stderr = io::stderr();
-    stderr.write_all(&output.stdout)?;
-    stderr.write_all(&output.stderr)?;
-    stderr.flush()?;
-
-    if !output.status.success() {
-        return Err("direnv allow failed".into());
-    }
-    Ok(())
-}
-
 fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>> {
     if items.is_empty() {
         return Ok(None);
     }
 
     let (mut terminal, _guard) = setup_terminal()?;
-    let mut query = String::new();
-    let mut cursor = 0usize;
+    let mut input = Input::default();
     let mut selected = 0usize;
     let mut sort_mode = SortMode::Match;
     let mut focus = Focus::Search;
@@ -389,7 +382,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
     let mut tag_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut tag_in_flight: HashSet<String> = HashSet::new();
     let mut tag_scan_started = false;
-    let mut filtered = filter_and_sort(items, &query, sort_mode, &meta_cache, &tag_cache);
+    let mut filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
     let mut preview_path: Option<String> = None;
     let mut in_flight: Option<String> = None;
     let mut preview_text = build_placeholder_text(None, accent, muted, text, "No selection");
@@ -401,10 +394,15 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
     let mut preview_page_step = 5usize;
     let mut git_page_step = 5usize;
     let start_time = Instant::now();
+    let mut tag_edit_path: Option<String> = None;
+    let mut tag_edit_tags: Vec<String> = Vec::new();
+    let mut tag_input = Input::default();
+    let mut tag_suggestions: Vec<String> = Vec::new();
 
     loop {
         let current = current_selection_path(items, &filtered, selected);
-        let tokens = parse_query_tokens(&query);
+        let query_value = input.value();
+        let tokens = parse_query_tokens(query_value);
 
         while let Ok(result) = preview_rx.try_recv() {
             preview_cache.insert(result.path.clone(), result.data.clone());
@@ -452,7 +450,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
 
         if resort_needed {
             let selected_path = current_selection_path(items, &filtered, selected);
-            filtered = filter_and_sort(items, &query, sort_mode, &meta_cache, &tag_cache);
+            filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
             selected = match selected_path {
                 Some(path) => index_for_path(items, &filtered, &path).unwrap_or(0),
                 None => adjust_selected_index(selected, filtered.len()),
@@ -461,7 +459,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
 
         if tags_changed && query_uses_tags {
             let selected_path = current_selection_path(items, &filtered, selected);
-            filtered = filter_and_sort(items, &query, sort_mode, &meta_cache, &tag_cache);
+            filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
             selected = match selected_path {
                 Some(path) => index_for_path(items, &filtered, &path).unwrap_or(0),
                 None => adjust_selected_index(selected, filtered.len()),
@@ -523,6 +521,9 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
         if focus == Focus::Git && git_text.is_none() {
             focus = Focus::Preview;
         }
+        if focus == Focus::TagEdit && tag_edit_path.is_none() {
+            focus = Focus::Preview;
+        }
 
         let show_git = git_text.is_some();
         let size = terminal.size()?;
@@ -553,17 +554,21 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
             let search_area = ui.search_area;
             let results_area = ui.results_area;
 
-            let query_label = if focus == Focus::Search {
-                build_query_line(&query, cursor, text, accent)
-            } else if query.is_empty() {
-                Line::from(Span::raw(""))
+            let search_width = search_area.width.saturating_sub(1) as usize;
+            let scroll = if search_width > 0 {
+                input.visual_scroll(search_width)
             } else {
-                Line::from(Span::styled(query.as_str(), Style::default().fg(text)))
+                0
             };
-            let search = Paragraph::new(Text::from(query_label))
+            let search = Paragraph::new(input.value())
+                .scroll((0, scroll as u16))
                 .alignment(Alignment::Left)
                 .wrap(Wrap { trim: false });
             frame.render_widget(search, search_area);
+            if focus == Focus::Search && search_area.width > 0 && search_area.height > 0 {
+                let cursor_x = input.visual_cursor().max(scroll).saturating_sub(scroll);
+                frame.set_cursor_position((search_area.x + cursor_x as u16, search_area.y));
+            }
 
             let list_inner_height = results_area.height as usize;
             let total = filtered.len();
@@ -614,19 +619,44 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                 .as_deref()
                 .map(entry_name)
                 .unwrap_or_else(|| "Preview".to_string());
-            let preview_tags = current
-                .as_deref()
-                .and_then(|path| tag_cache.get(path))
-                .cloned()
-                .unwrap_or_default();
+            let preview_tags = if focus == Focus::TagEdit {
+                tag_edit_tags.clone()
+            } else {
+                current
+                    .as_deref()
+                    .and_then(|path| tag_cache.get(path))
+                    .cloned()
+                    .unwrap_or_default()
+            };
             let preview_width = ui.preview_area.width.saturating_sub(2) as usize;
-            let preview_combined =
-                compose_preview_text(&preview_text, &preview_tags, preview_width, text);
+            let (preview_combined, tag_cursor) = if focus == Focus::TagEdit {
+                compose_preview_text_with_input(
+                    &preview_text,
+                    &preview_tags,
+                    &tag_input,
+                    preview_width,
+                    text,
+                )
+            } else {
+                (
+                    compose_preview_text(&preview_text, &preview_tags, preview_width, text),
+                    None,
+                )
+            };
             preview_max_scroll = text_line_count(&preview_combined).saturating_sub(preview_height);
             git_max_scroll = match git_text.as_ref() {
                 Some(git) => text_line_count(git).saturating_sub(git_height),
                 None => 0,
             };
+            if focus == Focus::TagEdit {
+                if let Some((row, _)) = tag_cursor {
+                    if row < preview_scroll {
+                        preview_scroll = row;
+                    } else if row >= preview_scroll + preview_height {
+                        preview_scroll = row.saturating_sub(preview_height.saturating_sub(1));
+                    }
+                }
+            }
             preview_scroll = preview_scroll.min(preview_max_scroll);
             git_scroll = git_scroll.min(git_max_scroll);
             render_side_panels(
@@ -641,12 +671,23 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                 preview_scroll as u16,
                 git_scroll as u16,
             );
+            if focus == Focus::TagEdit {
+                if let Some((row, col)) = tag_cursor {
+                    let visible_row = row.saturating_sub(preview_scroll);
+                    if visible_row < preview_height {
+                        let x = ui.preview_area.x + 1 + col as u16;
+                        let y = ui.preview_area.y + 1 + visible_row as u16;
+                        frame.set_cursor_position((x, y));
+                    }
+                }
+            }
 
             let help_line = build_help_line(
                 focus,
                 sort_mode,
                 show_git,
-                cursor >= query_len(&query),
+                input_at_end(&input),
+                !tag_input.value().trim().is_empty(),
                 preview_scroll,
                 preview_max_scroll,
                 git_scroll,
@@ -659,7 +700,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                     Block::default()
                         .borders(Borders::ALL)
                         .title("Keys")
-                        .border_style(Style::default().fg(accent))
+                        .border_style(Style::default().fg(muted))
                         .border_type(BorderType::Rounded),
                 )
                 .alignment(Alignment::Left)
@@ -680,7 +721,21 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                         terminal.show_cursor()?;
                         return Ok(None);
                     }
-                    if key.code == KeyCode::Enter {
+                    if key.code == KeyCode::Char('t')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && focus != Focus::TagEdit
+                    {
+                        if let Some(path) = current_selection_path(items, &filtered, selected) {
+                            tag_edit_path = Some(path.clone());
+                            tag_edit_tags = read_tags_for_path(&path);
+                            tag_input.reset();
+                            tag_suggestions = collect_tag_suggestions(&tag_cache);
+                            focus = Focus::TagEdit;
+                            preview_scroll = 0;
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Enter && focus != Focus::TagEdit {
                         if let Some(index) = filtered.get(selected) {
                             let value = items[*index].clone();
                             terminal.show_cursor()?;
@@ -691,8 +746,13 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         sort_mode = sort_mode.next();
-                        filtered =
-                            filter_and_sort(items, &query, sort_mode, &meta_cache, &tag_cache);
+                        filtered = filter_and_sort(
+                            items,
+                            input.value(),
+                            sort_mode,
+                            &meta_cache,
+                            &tag_cache,
+                        );
                         selected = 0;
                         list_offset = 0;
                         if sort_mode.uses_time() {
@@ -703,7 +763,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                 &date_tx,
                             );
                         }
-                        if parse_query_tokens(&query).needs_tags() && !tag_scan_started {
+                        if parse_query_tokens(input.value()).needs_tags() && !tag_scan_started {
                             spawn_bulk_tag_fetch(items, &tag_cache, &mut tag_in_flight, &tag_tx);
                             tag_scan_started = true;
                         }
@@ -722,79 +782,32 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                     selected += 1;
                                 }
                             }
-                            KeyCode::Left => {
-                                if key.modifiers.contains(KeyModifiers::SUPER) {
-                                    cursor = 0;
-                                } else if key
-                                    .modifiers
-                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                                {
-                                    move_cursor_word_left(&query, &mut cursor);
-                                } else {
-                                    move_cursor_left(&mut cursor);
-                                }
-                            }
-                            KeyCode::Right => {
-                                if key.modifiers.contains(KeyModifiers::SUPER) {
-                                    cursor = query_len(&query);
-                                } else if key
-                                    .modifiers
-                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                                {
-                                    move_cursor_word_right(&query, &mut cursor);
-                                } else if cursor >= query_len(&query) {
-                                    focus = Focus::Preview;
-                                } else {
-                                    move_cursor_right(&query, &mut cursor);
-                                }
-                            }
-                            KeyCode::Home => {
-                                cursor = 0;
-                            }
-                            KeyCode::End => {
-                                cursor = query_len(&query);
-                            }
-                            KeyCode::Backspace => {
-                                if key
-                                    .modifiers
-                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                                {
-                                    delete_word_before_cursor(&mut query, &mut cursor);
-                                } else {
-                                    delete_before_cursor(&mut query, &mut cursor);
-                                }
-                                filtered = filter_and_sort(
-                                    items,
-                                    &query,
-                                    sort_mode,
-                                    &meta_cache,
-                                    &tag_cache,
-                                );
-                                selected = 0;
-                                list_offset = 0;
-                                cursor = cursor.min(query_len(&query));
-                            }
-                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                query.clear();
-                                cursor = 0;
-                                filtered = filter_and_sort(
-                                    items,
-                                    &query,
-                                    sort_mode,
-                                    &meta_cache,
-                                    &tag_cache,
-                                );
-                                selected = 0;
-                                list_offset = 0;
-                            }
-                            KeyCode::Char(ch) => {
+                            KeyCode::Right
                                 if !key.modifiers.intersects(
                                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                                ) {
-                                    insert_at_cursor(&mut query, &mut cursor, ch);
+                                ) && input_at_end(&input) =>
+                            {
+                                focus = Focus::Preview;
+                            }
+                            _ => {
+                                let before = input.value().to_string();
+                                if key.modifiers.contains(KeyModifiers::SUPER) {
+                                    if key.code == KeyCode::Left {
+                                        input.handle(InputRequest::GoToStart);
+                                    } else if key.code == KeyCode::Right {
+                                        input.handle(InputRequest::GoToEnd);
+                                    }
+                                } else if key.code == KeyCode::Char('u')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                {
+                                    input.handle(InputRequest::DeleteLine);
+                                } else {
+                                    let _ = input.handle_event(&Event::Key(key));
+                                }
+                                if input.value() != before {
                                     filtered = filter_and_sort(
                                         items,
-                                        &query,
+                                        input.value(),
                                         sort_mode,
                                         &meta_cache,
                                         &tag_cache,
@@ -803,7 +816,55 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                     list_offset = 0;
                                 }
                             }
-                            _ => {}
+                        },
+                        Focus::TagEdit => match key.code {
+                            KeyCode::Enter => {
+                                commit_tag_input(
+                                    &mut tag_input,
+                                    &mut tag_edit_tags,
+                                    &tag_suggestions,
+                                );
+                                if let Some(path) = tag_edit_path.clone() {
+                                    save_tags_for_path(&path, &tag_edit_tags)?;
+                                    tag_cache.insert(path.clone(), tag_edit_tags.clone());
+                                }
+                                focus = Focus::Preview;
+                                tag_edit_path = None;
+                                tag_edit_tags.clear();
+                                tag_input.reset();
+                                let selected_path =
+                                    current_selection_path(items, &filtered, selected);
+                                filtered = filter_and_sort(
+                                    items,
+                                    input.value(),
+                                    sort_mode,
+                                    &meta_cache,
+                                    &tag_cache,
+                                );
+                                selected = match selected_path {
+                                    Some(value) => {
+                                        index_for_path(items, &filtered, &value).unwrap_or(0)
+                                    }
+                                    None => adjust_selected_index(selected, filtered.len()),
+                                };
+                            }
+                            KeyCode::Tab => {
+                                commit_tag_input(
+                                    &mut tag_input,
+                                    &mut tag_edit_tags,
+                                    &tag_suggestions,
+                                );
+                            }
+                            KeyCode::Backspace => {
+                                if tag_input.value().is_empty() {
+                                    tag_edit_tags.pop();
+                                } else {
+                                    let _ = tag_input.handle_event(&Event::Key(key));
+                                }
+                            }
+                            _ => {
+                                let _ = tag_input.handle_event(&Event::Key(key));
+                            }
                         },
                         Focus::Preview => match key.code {
                             KeyCode::Left => {
@@ -964,7 +1025,7 @@ fn filter_and_sort_by_match(
     if tokens.is_empty() {
         return (0..items.len()).collect();
     }
-    let mut scored: Vec<(usize, (usize, usize, usize, usize))> = Vec::new();
+    let mut scored: Vec<(usize, (usize, usize, usize, usize, usize))> = Vec::new();
     for (index, path) in items.iter().enumerate() {
         let tags = tag_cache.get(path).map(Vec::as_slice).unwrap_or(&[]);
         if !matches_tokens(path, tags, &tokens) {
@@ -1015,7 +1076,7 @@ fn parse_query_tokens(query: &str) -> QueryTokens {
 
 fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
     for token in &tokens.folder {
-        if !fuzzy_match(token, path) {
+        if !matches_path_token(token, path) {
             return false;
         }
     }
@@ -1027,7 +1088,7 @@ fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
     }
 
     for token in &tokens.any {
-        let path_match = fuzzy_match(token, path);
+        let path_match = matches_path_token(token, path);
         let tag_match = tags.iter().any(|tag| fuzzy_match(token, tag));
         if !(path_match || tag_match) {
             return false;
@@ -1037,34 +1098,42 @@ fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
     true
 }
 
+fn matches_path_token(token: &str, path: &str) -> bool {
+    let entry = entry_name(path);
+    fuzzy_match(token, &entry) || fuzzy_match(token, path)
+}
+
 fn match_score_tokens(
     tokens: &QueryTokens,
     path: &str,
     tags: &[String],
-) -> Option<(usize, usize, usize, usize)> {
+) -> Option<(usize, usize, usize, usize, usize)> {
+    let mut penalty_sum = 0usize;
     let mut span_sum = 0usize;
     let mut gap_sum = 0usize;
     let mut start_sum = 0usize;
     let mut len_sum = 0usize;
 
     for token in &tokens.folder {
-        let score = match_score(token, path)?;
-        span_sum = span_sum.saturating_add(score.0);
-        gap_sum = gap_sum.saturating_add(score.1);
-        start_sum = start_sum.saturating_add(score.2);
-        len_sum = len_sum.saturating_add(score.3);
+        let score = match_score_for_path(token, path)?;
+        penalty_sum = penalty_sum.saturating_add(score.0);
+        span_sum = span_sum.saturating_add(score.1);
+        gap_sum = gap_sum.saturating_add(score.2);
+        start_sum = start_sum.saturating_add(score.3);
+        len_sum = len_sum.saturating_add(score.4);
     }
 
     for token in &tokens.tags {
         let score = best_tag_score(token, tags)?;
-        span_sum = span_sum.saturating_add(score.0);
-        gap_sum = gap_sum.saturating_add(score.1);
-        start_sum = start_sum.saturating_add(score.2);
-        len_sum = len_sum.saturating_add(score.3);
+        penalty_sum = penalty_sum.saturating_add(score.0);
+        span_sum = span_sum.saturating_add(score.1);
+        gap_sum = gap_sum.saturating_add(score.2);
+        start_sum = start_sum.saturating_add(score.3);
+        len_sum = len_sum.saturating_add(score.4);
     }
 
     for token in &tokens.any {
-        let mut best = match_score(token, path);
+        let mut best = match_score_for_path(token, path);
         if let Some(tag_score) = best_tag_score(token, tags) {
             best = match best {
                 Some(path_score) => Some(path_score.min(tag_score)),
@@ -1072,17 +1141,18 @@ fn match_score_tokens(
             };
         }
         let score = best?;
-        span_sum = span_sum.saturating_add(score.0);
-        gap_sum = gap_sum.saturating_add(score.1);
-        start_sum = start_sum.saturating_add(score.2);
-        len_sum = len_sum.saturating_add(score.3);
+        penalty_sum = penalty_sum.saturating_add(score.0);
+        span_sum = span_sum.saturating_add(score.1);
+        gap_sum = gap_sum.saturating_add(score.2);
+        start_sum = start_sum.saturating_add(score.3);
+        len_sum = len_sum.saturating_add(score.4);
     }
 
-    Some((span_sum, gap_sum, start_sum, len_sum))
+    Some((penalty_sum, span_sum, gap_sum, start_sum, len_sum))
 }
 
-fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, usize)> {
-    let mut best: Option<(usize, usize, usize, usize)> = None;
+fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, usize, usize)> {
+    let mut best: Option<(usize, usize, usize, usize, usize)> = None;
     for tag in tags {
         if let Some(score) = match_score(token, tag) {
             best = match best {
@@ -1092,6 +1162,23 @@ fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, 
         }
     }
     best
+}
+
+fn match_score_for_path(token: &str, path: &str) -> Option<(usize, usize, usize, usize, usize)> {
+    let entry = entry_name(path);
+    if let Some(score) = match_score(token, &entry) {
+        return Some(score);
+    }
+    if let Some(score) = match_score(token, path) {
+        return Some((
+            score.0.saturating_add(2),
+            score.1,
+            score.2,
+            score.3,
+            score.4,
+        ));
+    }
+    None
 }
 
 fn filter_and_sort(
@@ -1195,125 +1282,12 @@ fn index_for_path(items: &[String], filtered: &[usize], path: &str) -> Option<us
     })
 }
 
-fn query_len(query: &str) -> usize {
-    query.chars().count()
-}
-
-fn byte_index_from_char(query: &str, char_index: usize) -> usize {
-    if char_index >= query_len(query) {
-        return query.len();
-    }
-    query
-        .char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(query.len())
-}
-
-fn insert_at_cursor(query: &mut String, cursor: &mut usize, ch: char) {
-    let index = byte_index_from_char(query, *cursor);
-    query.insert(index, ch);
-    *cursor += 1;
-}
-
-fn delete_before_cursor(query: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let end = byte_index_from_char(query, *cursor);
-    let start = byte_index_from_char(query, *cursor - 1);
-    query.replace_range(start..end, "");
-    *cursor = cursor.saturating_sub(1);
-}
-
-fn delete_word_before_cursor(query: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let chars: Vec<char> = query.chars().collect();
-    let mut index = *cursor;
-    while index > 0 && chars[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    while index > 0 && is_word_char(chars[index - 1]) {
-        index -= 1;
-    }
-    let start = byte_index_from_char(query, index);
-    let end = byte_index_from_char(query, *cursor);
-    query.replace_range(start..end, "");
-    *cursor = index;
-}
-
-fn move_cursor_left(cursor: &mut usize) {
-    if *cursor > 0 {
-        *cursor -= 1;
-    }
-}
-
-fn move_cursor_right(query: &str, cursor: &mut usize) {
-    let len = query_len(query);
-    if *cursor < len {
-        *cursor += 1;
-    }
-}
-
-fn move_cursor_word_left(query: &str, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
-    let chars: Vec<char> = query.chars().collect();
-    let mut index = *cursor;
-    while index > 0 && chars[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    while index > 0 && is_word_char(chars[index - 1]) {
-        index -= 1;
-    }
-    *cursor = index;
-}
-
-fn move_cursor_word_right(query: &str, cursor: &mut usize) {
-    let chars: Vec<char> = query.chars().collect();
-    let len = chars.len();
-    let mut index = *cursor;
-    while index < len && chars[index].is_whitespace() {
-        index += 1;
-    }
-    while index < len && is_word_char(chars[index]) {
-        index += 1;
-    }
-    *cursor = index;
-}
-
-fn is_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '-'
-}
-
-fn build_query_line(query: &str, cursor: usize, text: Color, accent: Color) -> Line<'static> {
-    let mut spans = Vec::new();
-    let cursor_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let mut index = 0usize;
-    for ch in query.chars() {
-        if index == cursor {
-            spans.push(Span::styled("|", cursor_style));
-        }
-        spans.push(Span::styled(ch.to_string(), Style::default().fg(text)));
-        index += 1;
-    }
-    if index == cursor {
-        spans.push(Span::styled("|", cursor_style));
-    }
-    if spans.is_empty() {
-        spans.push(Span::styled("|", cursor_style));
-    }
-    Line::from(spans)
-}
-
 fn build_help_line(
     focus: Focus,
     sort_mode: SortMode,
     show_git: bool,
     cursor_at_end: bool,
+    has_tag_input: bool,
     preview_scroll: usize,
     preview_max_scroll: usize,
     git_scroll: usize,
@@ -1334,6 +1308,8 @@ fn build_help_line(
                 spans.push(Span::styled("Right", key_style));
                 spans.push(Span::styled(" preview  ", regular_style));
             }
+            spans.push(Span::styled("Ctrl+T", key_style));
+            spans.push(Span::styled(" tag  ", regular_style));
             spans.push(Span::styled("Ctrl+S", key_style));
             spans.push(Span::styled(
                 format!(" {}  ", sort_mode.label()),
@@ -1351,6 +1327,8 @@ fn build_help_line(
                 spans.push(Span::styled("Right", key_style));
                 spans.push(Span::styled(" git  ", regular_style));
             }
+            spans.push(Span::styled("Ctrl+T", key_style));
+            spans.push(Span::styled(" tag  ", regular_style));
             if preview_scroll == 0 {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" search  ", regular_style));
@@ -1367,9 +1345,23 @@ fn build_help_line(
             spans.push(Span::styled(" search  ", regular_style));
             spans.push(Span::styled("Right", key_style));
             spans.push(Span::styled(" preview  ", regular_style));
+            spans.push(Span::styled("Ctrl+T", key_style));
+            spans.push(Span::styled(" tag  ", regular_style));
             if git_scroll == 0 {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" preview", regular_style));
+            }
+        }
+        Focus::TagEdit => {
+            spans.push(Span::styled("Tag", label_style));
+            spans.push(Span::styled("  ", regular_style));
+            spans.push(Span::styled("Tab", key_style));
+            spans.push(Span::styled(" add  ", regular_style));
+            spans.push(Span::styled("Enter", key_style));
+            if has_tag_input {
+                spans.push(Span::styled(" add+done", regular_style));
+            } else {
+                spans.push(Span::styled(" done", regular_style));
             }
         }
     }
@@ -1452,6 +1444,10 @@ fn text_line_count(text: &Text) -> usize {
     text.lines.len()
 }
 
+fn input_at_end(input: &Input) -> bool {
+    input.cursor() >= input.value().chars().count()
+}
+
 fn fuzzy_match(query: &str, text: &str) -> bool {
     let mut chars = query.chars().filter(|c| !c.is_whitespace());
     let mut current = chars.next();
@@ -1472,10 +1468,15 @@ fn fuzzy_match(query: &str, text: &str) -> bool {
     false
 }
 
-fn match_score(query: &str, text: &str) -> Option<(usize, usize, usize, usize)> {
+fn match_score(query: &str, text: &str) -> Option<(usize, usize, usize, usize, usize)> {
     let qchars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
     if qchars.is_empty() {
-        return Some((0, 0, 0, text.chars().count()));
+        return Some((0, 0, 0, 0, text.chars().count()));
+    }
+
+    if let Some(start) = find_case_insensitive(text, query) {
+        let span = qchars.len().saturating_sub(1);
+        return Some((0, span, 0, start, text.chars().count()));
     }
 
     let mut positions: Vec<usize> = Vec::with_capacity(qchars.len());
@@ -1504,7 +1505,23 @@ fn match_score(query: &str, text: &str) -> Option<(usize, usize, usize, usize)> 
         }
     }
     let text_len = text.chars().count();
-    Some((span, gaps, start, text_len))
+    Some((1, span, gaps, start, text_len))
+}
+
+fn find_case_insensitive(text: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let text_lower = text.to_lowercase();
+    let needle_lower = needle.to_lowercase();
+    let byte_index = text_lower.find(&needle_lower)?;
+    Some(char_index_from_byte(text, byte_index))
+}
+
+fn char_index_from_byte(text: &str, byte_index: usize) -> usize {
+    text.char_indices()
+        .take_while(|(idx, _)| *idx < byte_index)
+        .count()
 }
 
 fn adjust_selected_index(current: usize, len: usize) -> usize {
@@ -2020,6 +2037,127 @@ fn substring_by_char(value: &str, start: usize, len: usize) -> String {
     result
 }
 
+fn compose_preview_text_with_input(
+    base: &Text<'static>,
+    tags: &[String],
+    input: &Input,
+    width: usize,
+    text: Color,
+) -> (Text<'static>, Option<(usize, usize)>) {
+    let tag_lines = build_full_tag_lines(tags, width, text);
+    let input_line_index = tag_lines.len();
+    let scroll = input.visual_scroll(width.max(1));
+    let input_slice = substring_by_char(input.value(), scroll, width.max(1));
+    let input_line = Line::from(Span::styled(input_slice, Style::default().fg(text)));
+    let cursor_col = input.visual_cursor().max(scroll).saturating_sub(scroll);
+
+    let mut lines = Vec::new();
+    lines.extend(tag_lines);
+    lines.push(input_line);
+    lines.push(Line::from(""));
+    lines.extend(base.lines.clone());
+    let cursor = Some((input_line_index, cursor_col));
+    (Text::from(lines), cursor)
+}
+
+fn collect_tag_suggestions(tag_cache: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut set = HashSet::new();
+    for tags in tag_cache.values() {
+        for tag in tags {
+            if tag.starts_with("org/") {
+                continue;
+            }
+            set.insert(tag.clone());
+        }
+    }
+    let mut list: Vec<String> = set.into_iter().collect();
+    list.sort();
+    list
+}
+
+fn commit_tag_input(input: &mut Input, tags: &mut Vec<String>, suggestions: &[String]) {
+    let raw = input.value().trim();
+    if raw.is_empty() {
+        return;
+    }
+    let mut chosen = raw.to_string();
+    let lower = raw.to_lowercase();
+    if let Some(match_tag) = suggestions
+        .iter()
+        .find(|tag| tag.to_lowercase().starts_with(&lower))
+    {
+        chosen = match_tag.clone();
+    }
+    if !tags.iter().any(|tag| tag == &chosen) {
+        tags.push(chosen);
+    }
+    input.reset();
+}
+
+fn save_tags_for_path(path: &str, tags: &[String]) -> AppResult<()> {
+    let dir = Path::new(path);
+    let config_path = dir.join(".navgator.toml");
+    let contents = if config_path.exists() {
+        fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+    let updated = write_tags_into_toml(&contents, tags);
+    fs::write(config_path, updated)?;
+    Ok(())
+}
+
+fn write_tags_into_toml(contents: &str, tags: &[String]) -> String {
+    let line = format!("tags = [{}]", format_tags(tags));
+    if contents.trim().is_empty() {
+        return format!("{}\n", line);
+    }
+
+    let mut lines: Vec<String> = contents.lines().map(|line| line.to_string()).collect();
+    let mut start = None;
+    let mut end = None;
+    for (idx, raw) in lines.iter().enumerate() {
+        let cleaned = raw.split('#').next().unwrap_or("");
+        if start.is_none() {
+            if let Some(eq) = cleaned.find('=') {
+                let key = cleaned[..eq].trim();
+                if key == "tags" {
+                    start = Some(idx);
+                    if cleaned.contains(']') {
+                        end = Some(idx);
+                        break;
+                    }
+                }
+            }
+        } else if cleaned.contains(']') {
+            end = Some(idx);
+            break;
+        }
+    }
+
+    if start.is_none() {
+        let mut out = contents.trim_end().to_string();
+        out.push('\n');
+        out.push_str(&line);
+        out.push('\n');
+        return out;
+    }
+
+    let start = start.unwrap();
+    let end = end.unwrap_or(start);
+    lines.splice(start..=end, [line.to_string()]);
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn format_tags(tags: &[String]) -> String {
+    tags.iter()
+        .map(|tag| format!("\"{}\"", tag.replace('"', "\\\"")))
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
 fn compose_preview_text(
     base: &Text<'static>,
     tags: &[String],
@@ -2408,7 +2546,7 @@ fn render_side_panels(
     preview_scroll: u16,
     git_scroll: u16,
 ) {
-    let preview_focused = focus == Focus::Preview;
+    let preview_focused = matches!(focus, Focus::Preview | Focus::TagEdit);
     let git_focused = focus == Focus::Git;
     let preview_border_style = if preview_focused {
         Style::default().fg(accent)

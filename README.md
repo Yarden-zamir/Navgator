@@ -12,7 +12,6 @@ cargo build --release
 
 ```
 ./target/release/navgator navigate
-./target/release/navgator context <name> [--create|--no-create] [--template <template>] [--description <desc>]
 ```
 
 ## Zsh wrapper
@@ -47,7 +46,7 @@ Place a `.navgator.toml` in a folder:
 tags = ["mods", "minecraft", "create"]
 ```
 
-Tags render as colored pills in results and in the preview title. Colors are deterministic per tag name.
+Tags render as colored pills in results and in the preview. Colors are deterministic per tag name.
 
 ## Sorting
 
@@ -73,3 +72,25 @@ Sorting by time triggers background metadata scans.
 - Uses `erd` with `~/.erdtreerc` if present; otherwise defaults:
   `--dir-order=first --icons --sort=name --level=4 --color force --layout=inverted --human --suppress-size`
 - Git panel is hidden when not in a git repo.
+
+## Config
+
+No defaults are used. If no config is found, the app will exit and ask you to create one.
+
+Config file search order (merge all found):
+
+- `$NAVGATOR_CONFIG`
+- `/etc/navgator/config.toml`
+- `$XDG_CONFIG_HOME/navgator/config.toml`
+- `~/.config/navgator/config.toml`
+- `~/.navgator.toml`
+- `./.navgator.toml`
+- `./.navgator/config.toml`
+
+Config format (TOML):
+
+```
+[paths]
+index_folders = ["/Users/kcw/Github", "/Users/kcw/Desktop"]
+static_items = ["/opt/homebrew", "/Users/kcw/Downloads"]
+```
