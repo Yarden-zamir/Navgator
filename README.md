@@ -2,6 +2,8 @@
 
 Rust TUI directory picker with search, tags, and previews. Prints the selected path to stdout.
 
+![navgator screenshot](Screenshot.png)
+
 ## Build
 
 ```
@@ -90,12 +92,14 @@ Config file search order (merge all found):
 Config format (TOML):
 
 ```
-"$schema" = "https://raw.githubusercontent.com/Yarden-zamir/Navgator/34e366b278317ac3ad8777f9124a5b4677d856a4/config-schema.json"
+"$schema" = "https://raw.githubusercontent.com/Yarden-zamir/Navgator/main/config-schema.json"
 
 [paths]
 index_folders = ["/Users/kcw/Github", "/Users/kcw/Desktop"]
 static_items = ["/opt/homebrew", "/Users/kcw/Downloads"]
 ```
+
+If an existing config contains `[paths]` but no `"$schema"`, navgator prepends this line automatically when loading that config.
 
 Schema file is generated from the Rust config structs:
 
