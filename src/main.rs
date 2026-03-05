@@ -38,6 +38,8 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 
 const DATE_WIDTH: usize = 16;
 const DATE_PLACEHOLDER: &str = "---- -- -- --:--";
+const CONFIG_SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/Yarden-zamir/Navgator/main/config-schema.json";
 
 #[derive(Clone)]
 struct PreviewData {
@@ -266,6 +268,7 @@ fn load_config() -> AppResult<LoadedConfig> {
         let config: ConfigFile = Figment::from(Toml::file(&path))
             .extract()
             .map_err(|err| format!("Failed to parse config {}: {}", path.display(), err))?;
+        ensure_schema_link_in_config_file(&path, &config);
         if let Some(paths) = config.paths {
             merge_paths(
                 &paths.index_folders,
@@ -292,6 +295,29 @@ fn load_config() -> AppResult<LoadedConfig> {
         index_folders,
         static_items,
     })
+}
+
+fn ensure_schema_link_in_config_file(path: &Path, config: &ConfigFile) {
+    if config._schema_url.is_some() || config.paths.is_none() {
+        return;
+    }
+
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+
+    let schema_line = format!("\"$schema\" = \"{CONFIG_SCHEMA_URL}\"");
+    let updated = if contents.trim().is_empty() {
+        format!("{schema_line}\n")
+    } else if contents.starts_with('\n') {
+        format!("{schema_line}\n{contents}")
+    } else {
+        format!("{schema_line}\n\n{contents}")
+    };
+
+    if updated != contents {
+        let _ = fs::write(path, updated);
+    }
 }
 
 fn config_paths(home: &Path) -> Vec<PathBuf> {
