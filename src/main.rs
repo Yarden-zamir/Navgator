@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
+use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
 use std::{
     cmp::Ordering,
@@ -67,13 +68,15 @@ struct TagResult {
     tags: Vec<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, JsonSchema)]
 struct ConfigFile {
+    #[serde(default, rename = "$schema")]
+    _schema_url: Option<String>,
     #[serde(default)]
     paths: Option<ConfigPaths>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, JsonSchema)]
 struct ConfigPaths {
     #[serde(default)]
     index_folders: Vec<String>,
@@ -142,10 +145,13 @@ enum Focus {
 }
 
 fn main() -> AppResult<()> {
-    ensure_tty_stdin()?;
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "navigate" {
+        ensure_tty_stdin()?;
         return run_navigate();
+    }
+    if args[0] == "config-schema" || args[0] == "schema" {
+        return print_config_schema();
     }
     if args[0] == "--help" || args[0] == "-h" {
         print_usage();
@@ -177,7 +183,15 @@ fn ensure_tty_stdin() -> AppResult<()> {
 }
 
 fn print_usage() {
-    eprintln!("Usage:\n  navgator [navigate]");
+    eprintln!("Usage:\n  navgator [navigate|config-schema]");
+}
+
+fn print_config_schema() -> AppResult<()> {
+    let schema = schema_for!(ConfigFile);
+    let json = serde_json::to_string_pretty(&schema)
+        .map_err(|err| format!("Failed to serialize config schema: {err}"))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn run_navigate() -> AppResult<()> {
