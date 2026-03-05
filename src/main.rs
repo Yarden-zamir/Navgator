@@ -71,18 +71,42 @@ struct TagResult {
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
+#[schemars(
+    title = "Navgator Config",
+    description = "Configuration file for navgator path indexing and static items."
+)]
 struct ConfigFile {
     #[serde(default, rename = "$schema")]
+    #[schemars(
+        title = "Schema URL",
+        description = "Optional JSON Schema URL for editor autocompletion and validation."
+    )]
     _schema_url: Option<String>,
     #[serde(default)]
+    #[schemars(
+        title = "Paths",
+        description = "Path collection settings used to build the navigation list."
+    )]
     paths: Option<ConfigPaths>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
+#[schemars(
+    title = "Path Settings",
+    description = "Groups of folders that navgator indexes or always includes."
+)]
 struct ConfigPaths {
     #[serde(default)]
+    #[schemars(
+        title = "Index Folders",
+        description = "Directories to index; each directory and its direct child directories are included."
+    )]
     index_folders: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        title = "Static Items",
+        description = "Directories or files to include as-is without indexing children."
+    )]
     static_items: Vec<String>,
 }
 
