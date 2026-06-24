@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Terminal,
 };
 use schemars::{schema_for, JsonSchema};
@@ -35,21 +35,119 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::{Input, InputRequest};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+type MatchScore = (usize, usize, usize, usize, usize);
 
 const DATE_WIDTH: usize = 16;
 const DATE_PLACEHOLDER: &str = "---- -- -- --:--";
+const TAB_DIVIDER_WIDTH: usize = 3;
+const DEFAULT_WORKTREE_TAB_MIN_CHARS: usize = 6;
+const DEFAULT_SELECTED_WORKTREE_TAB_MIN_CHARS: usize = 10;
+const MIN_PARTIAL_TAB_WIDTH: usize = 4;
 const CONFIG_SCHEMA_URL: &str =
     "https://raw.githubusercontent.com/Yarden-zamir/Navgator/main/config-schema.json";
 
 #[derive(Clone)]
-struct PreviewData {
-    preview: Text<'static>,
+struct PreviewTab {
+    path: String,
+    label: String,
+    text: Text<'static>,
     git: Option<Text<'static>>,
+}
+
+#[derive(Clone)]
+struct PreviewData {
+    previews: Vec<PreviewTab>,
+    selected_repo_is_bare: bool,
+    git_loaded: bool,
+}
+
+struct PreviewTarget {
+    path: String,
+    label: String,
+}
+
+struct GitWorktree {
+    path: String,
+    branch: Option<String>,
+    detached: bool,
+    bare: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PreviewSettings {
+    shorten_worktree_tab_labels: bool,
+    worktree_tab_min_chars: usize,
+    selected_worktree_tab_min_chars: usize,
+}
+
+#[derive(Clone, Copy)]
+struct HelpContext {
+    focus: Focus,
+    sort_mode: SortMode,
+    show_git: bool,
+    cursor_at_end: bool,
+    has_tag_input: bool,
+    preview_tab_index: usize,
+    preview_tab_count: usize,
+    preview_scroll: usize,
+    preview_max_scroll: usize,
+    git_scroll: usize,
+}
+
+#[derive(Clone, Copy)]
+struct HelpColors {
+    text: Color,
+    accent: Color,
+    key_color: Color,
+}
+
+#[derive(Clone, Copy)]
+struct PreviewColors {
+    accent: Color,
+    muted: Color,
+    text: Color,
+}
+
+struct VisibleListArgs<'a> {
+    items: &'a [String],
+    filtered: &'a [usize],
+    selected: usize,
+    offset: usize,
+    height: usize,
+    text: Color,
+    muted: Color,
+    dates: &'a HashMap<String, String>,
+    tags: &'a HashMap<String, Vec<String>>,
+    inner_width: usize,
+    tokens: &'a QueryTokens,
+    elapsed_ms: u64,
+}
+
+struct SidePanelRender<'a> {
+    area: Rect,
+    preview: &'a Text<'static>,
+    git: Option<&'a Text<'static>>,
+    preview_title: &'a str,
+    preview_tab_labels: &'a [String],
+    preview_tab_index: usize,
+    preview_settings: PreviewSettings,
+    focus: Focus,
+    accent: Color,
+    text: Color,
+    preview_scroll: u16,
+    git_scroll: u16,
 }
 
 struct PreviewResult {
     path: String,
     data: PreviewData,
+}
+
+struct GitResult {
+    path: String,
+    tab_index: usize,
+    git: Option<Text<'static>>,
+    done: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -88,6 +186,9 @@ struct ConfigFile {
         description = "Path collection settings used to build the navigation list."
     )]
     paths: Option<ConfigPaths>,
+    #[serde(default)]
+    #[schemars(title = "Preview", description = "Preview panel settings.")]
+    preview: Option<ConfigPreview>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -110,9 +211,49 @@ struct ConfigPaths {
     static_items: Vec<String>,
 }
 
+#[derive(Default, Deserialize, JsonSchema)]
+#[schemars(
+    title = "Preview Settings",
+    description = "Settings for preview and worktree preview tabs."
+)]
+struct ConfigPreview {
+    #[serde(default)]
+    #[schemars(
+        title = "Shorten Worktree Tab Labels",
+        description = "When true, worktree tab labels use only the segment after the last slash, for example feat/yarden/potato becomes potato. Defaults to true."
+    )]
+    shorten_worktree_tab_labels: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        title = "Worktree Tab Minimum Characters",
+        description = "Minimum label characters to keep before the ellipsis for non-selected worktree preview tabs. Defaults to 6."
+    )]
+    worktree_tab_min_chars: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        title = "Selected Worktree Tab Minimum Characters",
+        description = "Minimum label characters to keep before the ellipsis for the selected worktree preview tab. Defaults to 10."
+    )]
+    selected_worktree_tab_min_chars: Option<usize>,
+}
+
 struct LoadedConfig {
     index_folders: Vec<PathBuf>,
     static_items: Vec<PathBuf>,
+    preview_settings: PreviewSettings,
+}
+
+struct BuildItemsResult {
+    items: Vec<String>,
+    preview_settings: PreviewSettings,
+}
+
+fn default_preview_settings() -> PreviewSettings {
+    PreviewSettings {
+        shorten_worktree_tab_labels: true,
+        worktree_tab_min_chars: DEFAULT_WORKTREE_TAB_MIN_CHARS,
+        selected_worktree_tab_min_chars: DEFAULT_SELECTED_WORKTREE_TAB_MIN_CHARS,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -221,8 +362,8 @@ fn print_config_schema() -> AppResult<()> {
 }
 
 fn run_navigate() -> AppResult<()> {
-    let items = build_items()?;
-    match select_from_list("Navigate", &items)? {
+    let result = build_items()?;
+    match select_from_list("Navigate", &result.items, result.preview_settings)? {
         Some(choice) => write_selection(&choice),
         None => std::process::exit(1),
     }
@@ -239,10 +380,11 @@ fn write_selection(path: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn build_items() -> AppResult<Vec<String>> {
+fn build_items() -> AppResult<BuildItemsResult> {
     let config = load_config()?;
     let mut items: Vec<PathBuf> = config.static_items;
     let index_folders = config.index_folders;
+    let preview_settings = config.preview_settings;
 
     for folder in index_folders {
         items.push(folder.clone());
@@ -267,7 +409,10 @@ fn build_items() -> AppResult<Vec<String>> {
             out.push(key);
         }
     }
-    Ok(out)
+    Ok(BuildItemsResult {
+        items: out,
+        preview_settings,
+    })
 }
 
 fn home_dir() -> AppResult<PathBuf> {
@@ -281,6 +426,7 @@ fn load_config() -> AppResult<LoadedConfig> {
     let mut static_items = Vec::new();
     let mut seen_index = HashSet::new();
     let mut seen_static = HashSet::new();
+    let mut preview_settings = default_preview_settings();
     let mut found_config = false;
 
     for path in config_paths(&home) {
@@ -289,9 +435,10 @@ fn load_config() -> AppResult<LoadedConfig> {
         }
         found_config = true;
         let base_dir = path.parent().unwrap_or(&home);
-        let config: ConfigFile = Figment::from(Toml::file(&path))
-            .extract()
-            .map_err(|err| format!("Failed to parse config {}: {}", path.display(), err))?;
+        let config: ConfigFile = Figment::from(Toml::file(&path)).extract().map_err(|err| {
+            let display_path = display_path_for_user(&path.to_string_lossy());
+            format!("Failed to parse config {}: {}", display_path, err)
+        })?;
         ensure_schema_link_in_config_file(&path, &config);
         if let Some(paths) = config.paths {
             merge_paths(
@@ -309,6 +456,17 @@ fn load_config() -> AppResult<LoadedConfig> {
                 &mut seen_static,
             );
         }
+        if let Some(preview) = config.preview {
+            if let Some(value) = preview.shorten_worktree_tab_labels {
+                preview_settings.shorten_worktree_tab_labels = value;
+            }
+            if let Some(value) = preview.worktree_tab_min_chars {
+                preview_settings.worktree_tab_min_chars = value.max(1);
+            }
+            if let Some(value) = preview.selected_worktree_tab_min_chars {
+                preview_settings.selected_worktree_tab_min_chars = value.max(1);
+            }
+        }
     }
 
     if !found_config {
@@ -318,6 +476,7 @@ fn load_config() -> AppResult<LoadedConfig> {
     Ok(LoadedConfig {
         index_folders,
         static_items,
+        preview_settings,
     })
 }
 
@@ -420,7 +579,11 @@ fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>> {
+fn select_from_list(
+    _title: &str,
+    items: &[String],
+    preview_settings: PreviewSettings,
+) -> AppResult<Option<String>> {
     if items.is_empty() {
         return Ok(None);
     }
@@ -438,9 +601,11 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
     let text = Color::Black;
     let muted = text;
     let (preview_tx, preview_rx) = mpsc::channel::<PreviewResult>();
+    let (git_tx, git_rx) = mpsc::channel::<GitResult>();
     let (date_tx, date_rx) = mpsc::channel::<MetaResult>();
     let (tag_tx, tag_rx) = mpsc::channel::<TagResult>();
     let mut preview_cache: HashMap<String, PreviewData> = HashMap::new();
+    let mut git_in_flight: HashSet<String> = HashSet::new();
     let mut date_cache: HashMap<String, String> = HashMap::new();
     let mut date_in_flight: HashSet<String> = HashSet::new();
     let mut tag_cache: HashMap<String, Vec<String>> = HashMap::new();
@@ -450,6 +615,9 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
     let mut preview_path: Option<String> = None;
     let mut in_flight: Option<String> = None;
     let mut preview_text = build_placeholder_text(None, accent, muted, text, "No selection");
+    let mut preview_tab_index = 0usize;
+    let mut preview_tab_count = 1usize;
+    let mut preview_tab_labels: Vec<String> = Vec::new();
     let mut git_text: Option<Text<'static>> = None;
     let mut preview_scroll = 0usize;
     let mut git_scroll = 0usize;
@@ -470,13 +638,56 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
 
         while let Ok(result) = preview_rx.try_recv() {
             preview_cache.insert(result.path.clone(), result.data.clone());
+            if let Some(data) = preview_cache.get(&result.path) {
+                ensure_git_for_preview(
+                    &result.path,
+                    data,
+                    &mut git_in_flight,
+                    &git_tx,
+                    preview_tab_index,
+                    PreviewColors {
+                        accent,
+                        muted,
+                        text,
+                    },
+                );
+            }
             if current.as_deref() == Some(result.path.as_str()) {
-                preview_text = result.data.preview;
-                git_text = result.data.git;
+                apply_preview_data(
+                    &result.data,
+                    &mut preview_tab_index,
+                    &mut preview_tab_count,
+                    &mut preview_tab_labels,
+                    &mut preview_text,
+                    &mut git_text,
+                );
                 preview_path = Some(result.path.clone());
             }
             if in_flight.as_deref() == Some(result.path.as_str()) {
                 in_flight = None;
+            }
+        }
+
+        while let Ok(result) = git_rx.try_recv() {
+            if result.done {
+                git_in_flight.remove(&result.path);
+            }
+            let mut updated = false;
+            if let Some(data) = preview_cache.get_mut(&result.path) {
+                apply_git_result(data, result.tab_index, result.git, result.done);
+                updated = true;
+            }
+            if updated && current.as_deref() == Some(result.path.as_str()) {
+                if let Some(data) = preview_cache.get(&result.path) {
+                    apply_preview_data(
+                        data,
+                        &mut preview_tab_index,
+                        &mut preview_tab_count,
+                        &mut preview_tab_labels,
+                        &mut preview_text,
+                        &mut git_text,
+                    );
+                }
             }
         }
 
@@ -538,18 +749,42 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                     git_text = None;
                     preview_path = None;
                     in_flight = None;
+                    preview_tab_index = 0;
+                    preview_tab_count = 1;
+                    preview_tab_labels.clear();
                     preview_scroll = 0;
                     git_scroll = 0;
                 }
             }
             Some(path) => {
                 if preview_path.as_deref() != Some(path) {
+                    preview_tab_index = 0;
+                    preview_tab_count = 1;
+                    preview_tab_labels.clear();
                     preview_scroll = 0;
                     git_scroll = 0;
                     if let Some(data) = preview_cache.get(path) {
-                        preview_text = data.preview.clone();
-                        git_text = data.git.clone();
+                        apply_preview_data(
+                            data,
+                            &mut preview_tab_index,
+                            &mut preview_tab_count,
+                            &mut preview_tab_labels,
+                            &mut preview_text,
+                            &mut git_text,
+                        );
                         preview_path = Some(path.to_string());
+                        ensure_git_for_preview(
+                            path,
+                            data,
+                            &mut git_in_flight,
+                            &git_tx,
+                            preview_tab_index,
+                            PreviewColors {
+                                accent,
+                                muted,
+                                text,
+                            },
+                        );
                     } else if in_flight.as_deref() != Some(path) {
                         preview_text = build_placeholder_text(
                             Some(path),
@@ -558,23 +793,23 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                             text,
                             "Loading preview...",
                         );
-                        git_text = Some(build_placeholder_text(
-                            Some(path),
-                            accent,
-                            muted,
-                            text,
-                            "Loading git info...",
-                        ));
+                        git_text = None;
+                        preview_tab_labels.clear();
                         preview_path = Some(path.to_string());
                         in_flight = Some(path.to_string());
                         let tx = preview_tx.clone();
                         let path_owned = path.to_string();
                         thread::spawn(move || {
-                            let preview = build_preview_text(&path_owned, accent, muted, text);
-                            let git = build_git_text(&path_owned, accent, muted, text);
+                            let data = build_preview_data(
+                                &path_owned,
+                                accent,
+                                muted,
+                                text,
+                                preview_settings,
+                            );
                             let _ = tx.send(PreviewResult {
                                 path: path_owned,
-                                data: PreviewData { preview, git },
+                                data,
                             });
                         });
                     }
@@ -646,20 +881,20 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
             ensure_dates_for_paths(&visible_paths, &date_cache, &mut date_in_flight, &date_tx);
             ensure_tags_for_paths(&visible_paths, &tag_cache, &mut tag_in_flight, &tag_tx);
 
-            let (list_items, list_selected) = build_visible_list_items(
+            let (list_items, list_selected) = build_visible_list_items(VisibleListArgs {
                 items,
-                &filtered,
+                filtered: &filtered,
                 selected,
-                list_offset,
-                list_inner_height,
+                offset: list_offset,
+                height: list_inner_height,
                 text,
                 muted,
-                &date_cache,
-                &tag_cache,
-                list_inner_width,
-                &tokens,
-                start_time.elapsed().as_millis() as u64,
-            );
+                dates: &date_cache,
+                tags: &tag_cache,
+                inner_width: list_inner_width,
+                tokens: &tokens,
+                elapsed_ms: start_time.elapsed().as_millis() as u64,
+            });
 
             let list = List::new(list_items).highlight_style(
                 Style::default()
@@ -672,17 +907,15 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
             state.select(list_selected);
             frame.render_stateful_widget(list, results_area, &mut state);
 
-            let preview_height = ui.preview_area.height.saturating_sub(2) as usize;
+            let preview_body_area = preview_content_area(ui.preview_area, preview_tab_count);
+            let preview_height = preview_body_area.height as usize;
             let git_height = ui
                 .git_area
                 .map(|rect| rect.height.saturating_sub(2) as usize)
                 .unwrap_or(0);
             preview_page_step = preview_height.max(1);
             git_page_step = git_height.max(1);
-            let preview_title = current
-                .as_deref()
-                .map(entry_name)
-                .unwrap_or_else(|| "Preview".to_string());
+            let preview_title = build_preview_panel_title(current.as_deref());
             let preview_tags = if focus == Focus::TagEdit {
                 tag_edit_tags.clone()
             } else {
@@ -692,7 +925,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                     .cloned()
                     .unwrap_or_default()
             };
-            let preview_width = ui.preview_area.width.saturating_sub(2) as usize;
+            let preview_width = preview_body_area.width as usize;
             let (preview_combined, tag_cursor) = if focus == Focus::TagEdit {
                 compose_preview_text_with_input(
                     &preview_text,
@@ -725,39 +958,50 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
             git_scroll = git_scroll.min(git_max_scroll);
             render_side_panels(
                 frame,
-                detail_area,
-                &preview_combined,
-                git_text.as_ref(),
-                &preview_title,
-                focus,
-                accent,
-                text,
-                preview_scroll as u16,
-                git_scroll as u16,
+                SidePanelRender {
+                    area: detail_area,
+                    preview: &preview_combined,
+                    git: git_text.as_ref(),
+                    preview_title: &preview_title,
+                    preview_tab_labels: &preview_tab_labels,
+                    preview_tab_index,
+                    preview_settings,
+                    focus,
+                    accent,
+                    text,
+                    preview_scroll: preview_scroll as u16,
+                    git_scroll: git_scroll as u16,
+                },
             );
             if focus == Focus::TagEdit {
                 if let Some((row, col)) = tag_cursor {
                     let visible_row = row.saturating_sub(preview_scroll);
                     if visible_row < preview_height {
-                        let x = ui.preview_area.x + 1 + col as u16;
-                        let y = ui.preview_area.y + 1 + visible_row as u16;
+                        let x = preview_body_area.x + col as u16;
+                        let y = preview_body_area.y + visible_row as u16;
                         frame.set_cursor_position((x, y));
                     }
                 }
             }
 
             let help_line = build_help_line(
-                focus,
-                sort_mode,
-                show_git,
-                input_at_end(&input),
-                !tag_input.value().trim().is_empty(),
-                preview_scroll,
-                preview_max_scroll,
-                git_scroll,
-                text,
-                accent,
-                key_color,
+                HelpContext {
+                    focus,
+                    sort_mode,
+                    show_git,
+                    cursor_at_end: input_at_end(&input),
+                    has_tag_input: !tag_input.value().trim().is_empty(),
+                    preview_tab_index,
+                    preview_tab_count,
+                    preview_scroll,
+                    preview_max_scroll,
+                    git_scroll,
+                },
+                HelpColors {
+                    text,
+                    accent,
+                    key_color,
+                },
             );
             let help = Paragraph::new(Text::from(help_line))
                 .block(
@@ -800,8 +1044,14 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                         continue;
                     }
                     if key.code == KeyCode::Enter && focus != Focus::TagEdit {
-                        if let Some(index) = filtered.get(selected) {
-                            let value = items[*index].clone();
+                        let value = enter_selection_path(
+                            focus,
+                            current.as_deref(),
+                            preview_tab_index,
+                            &preview_cache,
+                        )
+                        .or_else(|| filtered.get(selected).map(|index| items[*index].clone()));
+                        if let Some(value) = value {
                             terminal.show_cursor()?;
                             return Ok(Some(value));
                         }
@@ -837,9 +1087,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                     match focus {
                         Focus::Search => match key.code {
                             KeyCode::Up => {
-                                if selected > 0 {
-                                    selected -= 1;
-                                }
+                                selected = selected.saturating_sub(1);
                             }
                             KeyCode::Down => {
                                 if selected + 1 < filtered.len() {
@@ -919,12 +1167,11 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                     &tag_suggestions,
                                 );
                             }
+                            KeyCode::Backspace if tag_input.value().is_empty() => {
+                                tag_edit_tags.pop();
+                            }
                             KeyCode::Backspace => {
-                                if tag_input.value().is_empty() {
-                                    tag_edit_tags.pop();
-                                } else {
-                                    let _ = tag_input.handle_event(&Event::Key(key));
-                                }
+                                let _ = tag_input.handle_event(&Event::Key(key));
                             }
                             _ => {
                                 let _ = tag_input.handle_event(&Event::Key(key));
@@ -932,16 +1179,62 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                         },
                         Focus::Preview => match key.code {
                             KeyCode::Left => {
-                                focus = Focus::Search;
+                                if preview_tab_index > 0 {
+                                    preview_tab_index -= 1;
+                                    preview_scroll = 0;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        apply_preview_data(
+                                            data,
+                                            &mut preview_tab_index,
+                                            &mut preview_tab_count,
+                                            &mut preview_tab_labels,
+                                            &mut preview_text,
+                                            &mut git_text,
+                                        );
+                                    }
+                                } else {
+                                    focus = Focus::Search;
+                                }
                             }
                             KeyCode::Right => {
-                                if git_text.is_some() {
+                                if preview_tab_index + 1 < preview_tab_count {
+                                    preview_tab_index += 1;
+                                    preview_scroll = 0;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        apply_preview_data(
+                                            data,
+                                            &mut preview_tab_index,
+                                            &mut preview_tab_count,
+                                            &mut preview_tab_labels,
+                                            &mut preview_text,
+                                            &mut git_text,
+                                        );
+                                    }
+                                } else if git_text.is_some() {
                                     focus = Focus::Git;
                                 }
                             }
                             KeyCode::Up => {
                                 if preview_scroll > 0 {
                                     preview_scroll -= 1;
+                                } else if preview_tab_index > 0 {
+                                    preview_tab_index -= 1;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        apply_preview_data(
+                                            data,
+                                            &mut preview_tab_index,
+                                            &mut preview_tab_count,
+                                            &mut preview_tab_labels,
+                                            &mut preview_text,
+                                            &mut git_text,
+                                        );
+                                    }
                                 } else if preview_scroll == 0 {
                                     focus = Focus::Search;
                                 }
@@ -949,6 +1242,21 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                             KeyCode::Down => {
                                 if preview_scroll < preview_max_scroll {
                                     preview_scroll += 1;
+                                } else if preview_tab_index + 1 < preview_tab_count {
+                                    preview_tab_index += 1;
+                                    preview_scroll = 0;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        apply_preview_data(
+                                            data,
+                                            &mut preview_tab_index,
+                                            &mut preview_tab_count,
+                                            &mut preview_tab_labels,
+                                            &mut preview_text,
+                                            &mut git_text,
+                                        );
+                                    }
                                 } else if preview_scroll >= preview_max_scroll && git_text.is_some()
                                 {
                                     focus = Focus::Git;
@@ -971,7 +1279,21 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                         },
                         Focus::Git => match key.code {
                             KeyCode::Left => {
-                                focus = Focus::Search;
+                                preview_tab_index = preview_tab_count.saturating_sub(1);
+                                preview_scroll = 0;
+                                if let Some(data) =
+                                    current.as_deref().and_then(|path| preview_cache.get(path))
+                                {
+                                    apply_preview_data(
+                                        data,
+                                        &mut preview_tab_index,
+                                        &mut preview_tab_count,
+                                        &mut preview_tab_labels,
+                                        &mut preview_text,
+                                        &mut git_text,
+                                    );
+                                }
+                                focus = Focus::Preview;
                             }
                             KeyCode::Right => {
                                 focus = Focus::Preview;
@@ -983,10 +1305,8 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                     focus = Focus::Preview;
                                 }
                             }
-                            KeyCode::Down => {
-                                if git_scroll < git_max_scroll {
-                                    git_scroll += 1;
-                                }
+                            KeyCode::Down if git_scroll < git_max_scroll => {
+                                git_scroll += 1;
                             }
                             KeyCode::PageUp => {
                                 git_scroll = git_scroll.saturating_sub(git_page_step);
@@ -1029,9 +1349,7 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                     git_scroll = git_scroll.saturating_sub(1);
                                 }
                             } else if rect_contains(ui.results_area, col, row) {
-                                if selected > 0 {
-                                    selected -= 1;
-                                }
+                                selected = selected.saturating_sub(1);
                             }
                         }
                         MouseEventKind::ScrollDown => {
@@ -1042,9 +1360,9 @@ fn select_from_list(_title: &str, items: &[String]) -> AppResult<Option<String>>
                                     git_scroll = (git_scroll + 1).min(git_max_scroll);
                                 }
                             } else if rect_contains(ui.results_area, col, row) {
-                                if selected + 1 < filtered.len() {
-                                    selected += 1;
-                                }
+                                selected = selected
+                                    .saturating_add(1)
+                                    .min(filtered.len().saturating_sub(1));
                             }
                         }
                         _ => {}
@@ -1089,7 +1407,7 @@ fn filter_and_sort_by_match(
     if tokens.is_empty() {
         return (0..items.len()).collect();
     }
-    let mut scored: Vec<(usize, (usize, usize, usize, usize, usize))> = Vec::new();
+    let mut scored: Vec<(usize, MatchScore)> = Vec::new();
     for (index, path) in items.iter().enumerate() {
         let tags = tag_cache.get(path).map(Vec::as_slice).unwrap_or(&[]);
         if !matches_tokens(path, tags, &tokens) {
@@ -1167,11 +1485,7 @@ fn matches_path_token(token: &str, path: &str) -> bool {
     fuzzy_match(token, &entry) || fuzzy_match(token, path)
 }
 
-fn match_score_tokens(
-    tokens: &QueryTokens,
-    path: &str,
-    tags: &[String],
-) -> Option<(usize, usize, usize, usize, usize)> {
+fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Option<MatchScore> {
     let mut penalty_sum = 0usize;
     let mut span_sum = 0usize;
     let mut gap_sum = 0usize;
@@ -1215,8 +1529,8 @@ fn match_score_tokens(
     Some((penalty_sum, span_sum, gap_sum, start_sum, len_sum))
 }
 
-fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, usize, usize)> {
-    let mut best: Option<(usize, usize, usize, usize, usize)> = None;
+fn best_tag_score(token: &str, tags: &[String]) -> Option<MatchScore> {
+    let mut best: Option<MatchScore> = None;
     for tag in tags {
         if let Some(score) = match_score(token, tag) {
             best = match best {
@@ -1228,7 +1542,7 @@ fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, 
     best
 }
 
-fn match_score_for_path(token: &str, path: &str) -> Option<(usize, usize, usize, usize, usize)> {
+fn match_score_for_path(token: &str, path: &str) -> Option<MatchScore> {
     let entry = entry_name(path);
     if let Some(score) = match_score(token, &entry) {
         return Some(score);
@@ -1261,7 +1575,7 @@ fn filter_and_sort(
 }
 
 fn sort_indices(
-    indices: &mut Vec<usize>,
+    indices: &mut [usize],
     items: &[String],
     sort_mode: SortMode,
     meta_cache: &HashMap<String, SortMeta>,
@@ -1346,29 +1660,23 @@ fn index_for_path(items: &[String], filtered: &[usize], path: &str) -> Option<us
     })
 }
 
-fn build_help_line(
-    focus: Focus,
-    sort_mode: SortMode,
-    show_git: bool,
-    cursor_at_end: bool,
-    has_tag_input: bool,
-    preview_scroll: usize,
-    preview_max_scroll: usize,
-    git_scroll: usize,
-    text: Color,
-    accent: Color,
-    key_color: Color,
-) -> Line<'static> {
-    let key_style = Style::default().fg(key_color).add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let regular_style = Style::default().fg(text);
+fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<'static> {
+    let key_style = Style::default()
+        .fg(colors.key_color)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default()
+        .fg(colors.accent)
+        .add_modifier(Modifier::BOLD);
+    let regular_style = Style::default().fg(colors.text);
     let mut spans: Vec<Span> = Vec::new();
+    let has_prev_preview = context.preview_tab_index > 0;
+    let has_next_preview = context.preview_tab_index + 1 < context.preview_tab_count;
 
-    match focus {
+    match context.focus {
         Focus::Search => {
             spans.push(Span::styled("Search", label_style));
             spans.push(Span::styled("  ", regular_style));
-            if cursor_at_end {
+            if context.cursor_at_end {
                 spans.push(Span::styled("Right", key_style));
                 spans.push(Span::styled(" preview  ", regular_style));
             }
@@ -1376,28 +1684,47 @@ fn build_help_line(
             spans.push(Span::styled(" tag  ", regular_style));
             spans.push(Span::styled("Ctrl+S", key_style));
             spans.push(Span::styled(
-                format!(" {}  ", sort_mode.label()),
+                format!(" {}  ", context.sort_mode.label()),
                 regular_style,
             ));
             spans.push(Span::styled("Ctrl+U", key_style));
             spans.push(Span::styled(" clear", regular_style));
         }
         Focus::Preview => {
-            spans.push(Span::styled("Preview", label_style));
+            let label = if context.preview_tab_count > 1 {
+                format!(
+                    "Preview {}/{}",
+                    context.preview_tab_index + 1,
+                    context.preview_tab_count
+                )
+            } else {
+                "Preview".to_string()
+            };
+            spans.push(Span::styled(label, label_style));
             spans.push(Span::styled("  ", regular_style));
             spans.push(Span::styled("Left", key_style));
-            spans.push(Span::styled(" search  ", regular_style));
-            if show_git {
+            if has_prev_preview {
+                spans.push(Span::styled(" prev  ", regular_style));
+            } else {
+                spans.push(Span::styled(" search  ", regular_style));
+            }
+            if has_next_preview {
+                spans.push(Span::styled("Right", key_style));
+                spans.push(Span::styled(" next  ", regular_style));
+            } else if context.show_git {
                 spans.push(Span::styled("Right", key_style));
                 spans.push(Span::styled(" git  ", regular_style));
             }
             spans.push(Span::styled("Ctrl+T", key_style));
             spans.push(Span::styled(" tag  ", regular_style));
-            if preview_scroll == 0 {
+            if context.preview_scroll == 0 && !has_prev_preview {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" search  ", regular_style));
             }
-            if show_git && preview_scroll >= preview_max_scroll {
+            if has_next_preview && context.preview_scroll >= context.preview_max_scroll {
+                spans.push(Span::styled("Down", key_style));
+                spans.push(Span::styled(" next", regular_style));
+            } else if context.show_git && context.preview_scroll >= context.preview_max_scroll {
                 spans.push(Span::styled("Down", key_style));
                 spans.push(Span::styled(" git", regular_style));
             }
@@ -1406,12 +1733,12 @@ fn build_help_line(
             spans.push(Span::styled("Git", label_style));
             spans.push(Span::styled("  ", regular_style));
             spans.push(Span::styled("Left", key_style));
-            spans.push(Span::styled(" search  ", regular_style));
+            spans.push(Span::styled(" preview  ", regular_style));
             spans.push(Span::styled("Right", key_style));
             spans.push(Span::styled(" preview  ", regular_style));
             spans.push(Span::styled("Ctrl+T", key_style));
             spans.push(Span::styled(" tag  ", regular_style));
-            if git_scroll == 0 {
+            if context.git_scroll == 0 {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" preview", regular_style));
             }
@@ -1422,7 +1749,7 @@ fn build_help_line(
             spans.push(Span::styled("Tab", key_style));
             spans.push(Span::styled(" add  ", regular_style));
             spans.push(Span::styled("Enter", key_style));
-            if has_tag_input {
+            if context.has_tag_input {
                 spans.push(Span::styled(" add+done", regular_style));
             } else {
                 spans.push(Span::styled(" done", regular_style));
@@ -1504,6 +1831,24 @@ fn build_preview_title_line(title: &str, focused: bool, text: Color) -> Line<'st
     Line::from(Span::styled(label, Style::default().fg(text)))
 }
 
+fn panel_inner_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn preview_content_area(area: Rect, tab_count: usize) -> Rect {
+    let mut inner = panel_inner_area(area);
+    if tab_count > 1 && inner.height > 0 {
+        inner.y = inner.y.saturating_add(1);
+        inner.height = inner.height.saturating_sub(1);
+    }
+    inner
+}
+
 fn text_line_count(text: &Text) -> usize {
     text.lines.len()
 }
@@ -1532,7 +1877,7 @@ fn fuzzy_match(query: &str, text: &str) -> bool {
     false
 }
 
-fn match_score(query: &str, text: &str) -> Option<(usize, usize, usize, usize, usize)> {
+fn match_score(query: &str, text: &str) -> Option<MatchScore> {
     let qchars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
     if qchars.is_empty() {
         return Some((0, 0, 0, 0, text.chars().count()));
@@ -1622,75 +1967,63 @@ fn compute_list_window_offset(
     offset
 }
 
-fn build_visible_list_items(
-    items: &[String],
-    filtered: &[usize],
-    selected: usize,
-    offset: usize,
-    height: usize,
-    text: Color,
-    muted: Color,
-    dates: &HashMap<String, String>,
-    tags: &HashMap<String, Vec<String>>,
-    inner_width: usize,
-    tokens: &QueryTokens,
-    elapsed_ms: u64,
-) -> (Vec<ListItem<'static>>, Option<usize>) {
-    if filtered.is_empty() || height == 0 {
+fn build_visible_list_items(args: VisibleListArgs<'_>) -> (Vec<ListItem<'static>>, Option<usize>) {
+    if args.filtered.is_empty() || args.height == 0 {
         let item = ListItem::new(Line::from(Span::styled(
             "No matches",
-            Style::default().fg(muted),
+            Style::default().fg(args.muted),
         )));
         return (vec![item], None);
     }
 
-    let end = (offset + height).min(filtered.len());
-    let visible = &filtered[offset..end];
+    let end = (args.offset + args.height).min(args.filtered.len());
+    let visible = &args.filtered[args.offset..end];
     let mut list_items = Vec::with_capacity(visible.len());
 
     for item_index in visible.iter() {
-        let path = &items[*item_index];
+        let path = &args.items[*item_index];
         let entry = entry_name(path);
-        let date_value = dates
+        let date_value = args
+            .dates
             .get(path)
             .map(String::as_str)
             .unwrap_or(DATE_PLACEHOLDER);
         let date_display = format_date_display(date_value);
         let date_len = date_display.chars().count();
-        let tag_list = tags.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        let max_entry = inner_width.saturating_sub(date_len + 1);
+        let tag_list = args.tags.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let max_entry = args.inner_width.saturating_sub(date_len + 1);
         let mut entry_display = truncate_with_ellipsis(&entry, max_entry);
         let mut entry_len = entry_display.chars().count();
-        if entry_len + date_len + 1 > inner_width {
-            let new_len = inner_width.saturating_sub(date_len + 1);
+        if entry_len + date_len + 1 > args.inner_width {
+            let new_len = args.inner_width.saturating_sub(date_len + 1);
             entry_display = truncate_with_ellipsis(&entry, new_len);
             entry_len = entry_display.chars().count();
         }
 
-        let remaining = inner_width.saturating_sub(entry_len + date_len);
+        let remaining = args.inner_width.saturating_sub(entry_len + date_len);
         let tag_space = remaining.saturating_sub(1);
         let (tag_spans, tag_len) = if tag_space > 0 {
-            build_tag_spans(tag_list, tokens, tag_space, elapsed_ms, text)
+            build_tag_spans(tag_list, args.tokens, tag_space, args.elapsed_ms, args.text)
         } else {
             (Vec::new(), 0)
         };
         let tag_block_len = if tag_len > 0 { tag_len + 1 } else { 0 };
         let right_block_len = date_len + tag_block_len;
-        let padding = inner_width.saturating_sub(entry_len + right_block_len);
+        let padding = args.inner_width.saturating_sub(entry_len + right_block_len);
         let mut spans = Vec::new();
-        spans.push(Span::styled(entry_display, Style::default().fg(text)));
+        spans.push(Span::styled(entry_display, Style::default().fg(args.text)));
         spans.push(Span::raw(" ".repeat(padding)));
         if tag_len > 0 {
             spans.push(Span::raw(" "));
             spans.extend(tag_spans);
         }
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(date_display, Style::default().fg(muted)));
+        spans.push(Span::styled(date_display, Style::default().fg(args.muted)));
         let line = Line::from(spans);
         list_items.push(ListItem::new(line));
     }
 
-    let list_selected = selected.checked_sub(offset);
+    let list_selected = args.selected.checked_sub(args.offset);
     (list_items, list_selected)
 }
 
@@ -1702,11 +2035,59 @@ fn entry_name(path: &str) -> String {
         .to_string()
 }
 
+fn display_path_for_user(path: &str) -> String {
+    match env::var("HOME") {
+        Ok(home) => display_path_with_home(path, &home),
+        Err(_) => path.to_string(),
+    }
+}
+
+fn display_path_with_home(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+
+    let home_with_separator = format!(
+        "{}{}",
+        home.trim_end_matches(std::path::MAIN_SEPARATOR),
+        std::path::MAIN_SEPARATOR
+    );
+    if let Some(rest) = path.strip_prefix(&home_with_separator) {
+        return format!("~/{}", rest);
+    }
+
+    path.to_string()
+}
+
 fn current_selection_path(items: &[String], filtered: &[usize], selected: usize) -> Option<String> {
     filtered
         .get(selected)
         .and_then(|index| items.get(*index))
         .cloned()
+}
+
+fn enter_selection_path(
+    focus: Focus,
+    current_path: Option<&str>,
+    preview_tab_index: usize,
+    preview_cache: &HashMap<String, PreviewData>,
+) -> Option<String> {
+    if !matches!(focus, Focus::Preview | Focus::Git) {
+        return None;
+    }
+    let current_path = current_path?;
+    preview_cache
+        .get(current_path)
+        .and_then(|data| data.previews.get(preview_tab_index))
+        .map(|tab| tab.path.clone())
+}
+
+fn build_preview_panel_title(path: Option<&str>) -> String {
+    path.map(entry_name)
+        .unwrap_or_else(|| "Preview".to_string())
 }
 
 fn visible_paths_for_window(
@@ -1856,7 +2237,7 @@ fn extract_quoted_strings(value: &str) -> Vec<String> {
     while let Some(ch) = chars.next() {
         if ch == '"' {
             let mut text = String::new();
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == '"' {
                     break;
                 }
@@ -2266,7 +2647,7 @@ fn wrap_tag_segments(segments: &[TagSegment], width: usize) -> Vec<Line<'static>
         }
         let mut offset = 0usize;
         while offset < seg.len {
-            if current_len == 0 && seg.text.chars().next() == Some(' ') {
+            if current_len == 0 && seg.text.starts_with(' ') {
                 offset = offset.saturating_add(1);
                 continue;
             }
@@ -2353,6 +2734,151 @@ fn build_placeholder_text(
     Text::from(lines)
 }
 
+fn apply_preview_data(
+    data: &PreviewData,
+    tab_index: &mut usize,
+    tab_count: &mut usize,
+    tab_labels: &mut Vec<String>,
+    preview_text: &mut Text<'static>,
+    git_text: &mut Option<Text<'static>>,
+) {
+    if data.previews.is_empty() {
+        return;
+    }
+
+    *tab_count = data.previews.len();
+    *tab_labels = data.previews.iter().map(|tab| tab.label.clone()).collect();
+    *tab_index = (*tab_index).min(data.previews.len().saturating_sub(1));
+    let tab = &data.previews[*tab_index];
+    *preview_text = tab.text.clone();
+    *git_text = tab.git.clone();
+}
+
+fn apply_git_result(
+    data: &mut PreviewData,
+    tab_index: usize,
+    git: Option<Text<'static>>,
+    done: bool,
+) {
+    if let Some(tab) = data.previews.get_mut(tab_index) {
+        tab.git = git;
+    }
+    if done {
+        data.git_loaded = true;
+    }
+}
+
+fn ensure_git_for_preview(
+    path: &str,
+    data: &PreviewData,
+    git_in_flight: &mut HashSet<String>,
+    git_tx: &mpsc::Sender<GitResult>,
+    preferred_tab_index: usize,
+    colors: PreviewColors,
+) {
+    if data.git_loaded || data.previews.is_empty() || git_in_flight.contains(path) {
+        return;
+    }
+
+    git_in_flight.insert(path.to_string());
+    let tx = git_tx.clone();
+    let path_owned = path.to_string();
+    let selected_repo_is_bare = data.selected_repo_is_bare;
+    let tab_paths = data
+        .previews
+        .iter()
+        .map(|tab| tab.path.clone())
+        .collect::<Vec<String>>();
+
+    thread::spawn(move || {
+        let mut order = Vec::with_capacity(tab_paths.len());
+        let preferred = preferred_tab_index.min(tab_paths.len().saturating_sub(1));
+        order.push(preferred);
+        order.extend((0..tab_paths.len()).filter(|index| *index != preferred));
+
+        for (order_index, tab_index) in order.iter().enumerate() {
+            let git = build_git_text_for_preview(
+                &tab_paths[*tab_index],
+                selected_repo_is_bare,
+                colors.accent,
+                colors.muted,
+                colors.text,
+            );
+            let _ = tx.send(GitResult {
+                path: path_owned.clone(),
+                tab_index: *tab_index,
+                git,
+                done: order_index + 1 == order.len(),
+            });
+        }
+    });
+}
+
+fn build_preview_data(
+    path: &str,
+    accent: Color,
+    muted: Color,
+    text: Color,
+    preview_settings: PreviewSettings,
+) -> PreviewData {
+    let selected_repo_is_bare = git_command_dir_for_path(Path::new(path))
+        .map(|dir| git_is_bare_repository(&dir))
+        .unwrap_or(false);
+    let targets = preview_targets_for_path(path, preview_settings.shorten_worktree_tab_labels);
+    let previews = targets
+        .into_iter()
+        .map(|target| PreviewTab {
+            path: target.path.clone(),
+            label: target.label,
+            text: build_preview_text(&target.path, accent, muted, text),
+            git: None,
+        })
+        .collect();
+    PreviewData {
+        previews,
+        selected_repo_is_bare,
+        git_loaded: false,
+    }
+}
+
+fn preview_targets_for_path(path: &str, shorten_worktree_tab_labels: bool) -> Vec<PreviewTarget> {
+    let fallback = PreviewTarget {
+        path: path.to_string(),
+        label: entry_name(path),
+    };
+    let path_buf = Path::new(path);
+    let worktrees = git_worktrees_for_path(path_buf);
+    if worktrees.is_empty() {
+        return vec![fallback];
+    }
+
+    let non_bare: Vec<&GitWorktree> = worktrees.iter().filter(|worktree| !worktree.bare).collect();
+    let selected_is_bare = git_command_dir_for_path(path_buf)
+        .map(|dir| git_is_bare_repository(&dir))
+        .unwrap_or(false);
+    if selected_is_bare && !non_bare.is_empty() {
+        return preview_targets_from_worktrees(&non_bare, shorten_worktree_tab_labels);
+    }
+    if non_bare.len() > 1 {
+        return preview_targets_from_worktrees(&non_bare, shorten_worktree_tab_labels);
+    }
+
+    vec![fallback]
+}
+
+fn preview_targets_from_worktrees(
+    worktrees: &[&GitWorktree],
+    shorten_worktree_tab_labels: bool,
+) -> Vec<PreviewTarget> {
+    worktrees
+        .iter()
+        .map(|worktree| PreviewTarget {
+            path: worktree.path.clone(),
+            label: git_worktree_label(worktree, shorten_worktree_tab_labels),
+        })
+        .collect()
+}
+
 fn build_preview_text(path: &str, accent: Color, muted: Color, text: Color) -> Text<'static> {
     let value = Style::default().fg(text);
     let heading = Style::default().fg(accent).add_modifier(Modifier::BOLD);
@@ -2377,31 +2903,65 @@ fn build_preview_text(path: &str, accent: Color, muted: Color, text: Color) -> T
     Text::from(lines)
 }
 
-fn build_git_text(path: &str, accent: Color, _muted: Color, text: Color) -> Option<Text<'static>> {
+fn build_git_text_for_preview(
+    path: &str,
+    selected_repo_is_bare: bool,
+    accent: Color,
+    _muted: Color,
+    text: Color,
+) -> Option<Text<'static>> {
     let heading = Style::default().fg(accent).add_modifier(Modifier::BOLD);
     let value = Style::default().fg(text);
     let max_lines = 200usize;
 
     let path_buf = Path::new(path);
-    let repo_dir = if path_buf.is_dir() {
-        path_buf.to_path_buf()
-    } else {
-        path_buf.parent()?.to_path_buf()
-    };
-
-    let inside = run_git_command_allow_empty(&repo_dir, &["rev-parse", "--is-inside-work-tree"])?;
-    if inside.trim() != "true" {
+    let repo_dir = git_command_dir_for_path(path_buf)?;
+    let inside_work_tree = git_is_inside_work_tree(&repo_dir);
+    let bare_repository = git_is_bare_repository(&repo_dir);
+    if !inside_work_tree && !bare_repository {
         return None;
     }
 
     let mut lines = Vec::new();
-    if let Some(status_output) = run_git_command_allow_empty(&repo_dir, &["status", "-sb"]) {
-        if let Some(first_line) = status_output.lines().next() {
-            let branch = first_line.trim_start_matches("## ");
-            if !branch.trim().is_empty() {
+    if selected_repo_is_bare {
+        lines.push(Line::from(Span::styled("Bare repository", heading)));
+    }
+
+    if inside_work_tree {
+        if let Some(status_output) = run_git_command_allow_empty(&repo_dir, &["status", "-sb"]) {
+            if let Some(first_line) = status_output.lines().next() {
+                let branch = first_line.trim_start_matches("## ");
+                if !branch.trim().is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("Branch: {}", branch),
+                        heading,
+                    )));
+                }
+            }
+        }
+    }
+
+    if bare_repository {
+        let worktrees = git_worktrees_for_path(path_buf);
+        let non_bare_worktrees = worktrees
+            .iter()
+            .filter(|worktree| !worktree.bare)
+            .collect::<Vec<&GitWorktree>>();
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled("Worktrees", heading)));
+        if non_bare_worktrees.is_empty() {
+            lines.push(Line::from(Span::styled("No worktrees", value)));
+        } else {
+            for worktree in non_bare_worktrees {
                 lines.push(Line::from(Span::styled(
-                    format!("Branch: {}", branch),
-                    heading,
+                    format!(
+                        "{}  {}",
+                        git_worktree_label(worktree, false),
+                        display_path_for_user(&worktree.path)
+                    ),
+                    value,
                 )));
             }
         }
@@ -2417,8 +2977,15 @@ fn build_git_text(path: &str, accent: Color, _muted: Color, text: Color) -> Opti
             lines.push(Line::from(Span::styled("Recent commits", heading)));
             lines.extend(lines_from_output(&log_output, value, max_lines));
         }
-    } else {
+    } else if inside_work_tree {
         return None;
+    }
+
+    if !inside_work_tree {
+        if lines.is_empty() {
+            return None;
+        }
+        return Some(Text::from(lines));
     }
 
     if let Some(staged_output) =
@@ -2461,8 +3028,142 @@ fn build_git_text(path: &str, accent: Color, _muted: Color, text: Color) -> Opti
     Some(Text::from(lines))
 }
 
+fn git_command_dir_for_path(path: &Path) -> Option<PathBuf> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf)?
+    };
+
+    if git_command_succeeds(&dir, &["rev-parse", "--git-dir"]) {
+        return Some(dir);
+    }
+
+    let dot_bare = dir.join(".bare");
+    if dot_bare.is_dir() && git_is_bare_repository(&dot_bare) {
+        return Some(dot_bare);
+    }
+
+    Some(dir)
+}
+
+fn git_is_inside_work_tree(repo_dir: &Path) -> bool {
+    run_git_command_allow_empty(repo_dir, &["rev-parse", "--is-inside-work-tree"])
+        .map(|value| value.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn git_is_bare_repository(repo_dir: &Path) -> bool {
+    run_git_command_allow_empty(repo_dir, &["rev-parse", "--is-bare-repository"])
+        .map(|value| value.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn git_worktrees_for_path(path: &Path) -> Vec<GitWorktree> {
+    let Some(repo_dir) = git_command_dir_for_path(path) else {
+        return Vec::new();
+    };
+    let Some(output) = run_git_command_allow_empty(&repo_dir, &["worktree", "list", "--porcelain"])
+    else {
+        return Vec::new();
+    };
+    parse_git_worktree_list(&output)
+}
+
+fn git_command_succeeds(repo_dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("-c")
+        .arg("color.ui=never")
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn parse_git_worktree_list(output: &str) -> Vec<GitWorktree> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktree> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            current = Some(GitWorktree {
+                path: path.to_string(),
+                branch: None,
+                detached: false,
+                bare: false,
+            });
+        } else if let Some(worktree) = current.as_mut() {
+            if let Some(branch) = line.strip_prefix("branch ") {
+                worktree.branch = Some(git_branch_label(branch));
+            } else if line == "detached" {
+                worktree.detached = true;
+            } else if line == "bare" {
+                worktree.bare = true;
+            }
+        }
+    }
+
+    if let Some(worktree) = current {
+        worktrees.push(worktree);
+    }
+
+    worktrees
+}
+
+fn git_branch_label(branch: &str) -> String {
+    if let Some(value) = branch.strip_prefix("refs/heads/") {
+        return value.to_string();
+    }
+    if let Some(value) = branch.strip_prefix("refs/remotes/") {
+        return value.to_string();
+    }
+    branch.to_string()
+}
+
+fn git_worktree_label(worktree: &GitWorktree, shorten_after_slash: bool) -> String {
+    if let Some(branch) = worktree.branch.as_ref() {
+        if !branch.trim().is_empty() {
+            return worktree_tab_label(branch, shorten_after_slash);
+        }
+    }
+    if worktree.detached {
+        return "detached".to_string();
+    }
+    let name = entry_name(&worktree.path);
+    if name.trim().is_empty() {
+        "worktree".to_string()
+    } else {
+        worktree_tab_label(&name, shorten_after_slash)
+    }
+}
+
+fn worktree_tab_label(label: &str, shorten_after_slash: bool) -> String {
+    if !shorten_after_slash {
+        return label.to_string();
+    }
+    label
+        .rsplit('/')
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or(label)
+        .to_string()
+}
+
 fn build_path_lines(path: &str, value: Style) -> Vec<Line<'static>> {
-    vec![Line::from(Span::styled(path.to_string(), value))]
+    vec![Line::from(Span::styled(display_path_for_user(path), value))]
 }
 
 fn erd_output(path: &Path) -> Option<String> {
@@ -2598,55 +3299,221 @@ fn run_git_command_allow_empty(repo_dir: &Path, args: &[&str]) -> Option<String>
     )
 }
 
-fn render_side_panels(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    preview: &Text<'static>,
-    git: Option<&Text<'static>>,
-    preview_title: &str,
-    focus: Focus,
-    accent: Color,
-    text: Color,
-    preview_scroll: u16,
-    git_scroll: u16,
-) {
-    let preview_focused = matches!(focus, Focus::Preview | Focus::TagEdit);
-    let git_focused = focus == Focus::Git;
-    let preview_border_style = if preview_focused {
-        Style::default().fg(accent)
+fn visible_tab_window(
+    labels: &[String],
+    selected: usize,
+    width: usize,
+    settings: PreviewSettings,
+) -> (Vec<String>, usize) {
+    if labels.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let selected = selected.min(labels.len() - 1);
+    if width == 0 {
+        return (vec![labels[selected].clone()], 0);
+    }
+
+    let mut start = selected.saturating_sub(1);
+    let mut count = labels.len() - start;
+    let selected_offset = selected - start;
+    let selected_only_count = selected_offset + 1;
+    let preferred_count = if selected + 1 < labels.len() {
+        selected_offset + 2
     } else {
-        Style::default().fg(text)
+        selected_only_count
+    };
+
+    while count > preferred_count
+        && min_tab_window_width(&labels[start..start + count], selected - start, settings) > width
+    {
+        count -= 1;
+    }
+    while count > selected_only_count
+        && min_tab_window_width(&labels[start..start + count], selected - start, settings) > width
+    {
+        count -= 1;
+    }
+    if min_tab_window_width(&labels[start..start + count], selected - start, settings) > width
+        && selected > start
+    {
+        start = selected;
+        count = 1;
+    }
+
+    let selected_index = selected - start;
+    let mut visible = fit_tab_labels(
+        &labels[start..start + count],
+        selected_index,
+        width,
+        settings,
+    );
+    let next_index = start + count;
+    if next_index < labels.len() {
+        let used = rendered_tab_width(&visible);
+        let partial_width = width.saturating_sub(used.saturating_add(TAB_DIVIDER_WIDTH));
+        if partial_width >= MIN_PARTIAL_TAB_WIDTH {
+            visible.push(truncate_tab_label(&labels[next_index], partial_width));
+        }
+    }
+
+    (visible, selected_index)
+}
+
+fn min_tab_window_width(
+    labels: &[String],
+    selected_index: usize,
+    settings: PreviewSettings,
+) -> usize {
+    if labels.is_empty() {
+        return 0;
+    }
+    let label_width = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            tab_min_width(
+                label,
+                if index == selected_index {
+                    settings.selected_worktree_tab_min_chars
+                } else {
+                    settings.worktree_tab_min_chars
+                },
+            )
+        })
+        .sum::<usize>();
+    label_width + labels.len().saturating_sub(1) * TAB_DIVIDER_WIDTH
+}
+
+fn rendered_tab_width(labels: &[String]) -> usize {
+    if labels.is_empty() {
+        return 0;
+    }
+    labels
+        .iter()
+        .map(|label| label.chars().count())
+        .sum::<usize>()
+        + labels.len().saturating_sub(1) * TAB_DIVIDER_WIDTH
+}
+
+fn fit_tab_labels(
+    labels: &[String],
+    selected_index: usize,
+    width: usize,
+    settings: PreviewSettings,
+) -> Vec<String> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+
+    let divider_width = labels.len().saturating_sub(1) * TAB_DIVIDER_WIDTH;
+    let budget = width.saturating_sub(divider_width);
+    let mut widths = labels
+        .iter()
+        .map(|label| label.chars().count())
+        .collect::<Vec<usize>>();
+    let min_widths = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            tab_min_width(
+                label,
+                if index == selected_index {
+                    settings.selected_worktree_tab_min_chars
+                } else {
+                    settings.worktree_tab_min_chars
+                },
+            )
+        })
+        .collect::<Vec<usize>>();
+
+    while widths.iter().sum::<usize>() > budget {
+        let mut changed = false;
+        for index in (0..widths.len()).rev() {
+            if widths[index] > min_widths[index] {
+                widths[index] -= 1;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    while widths.iter().sum::<usize>() > budget {
+        let Some((index, _)) = widths.iter().enumerate().max_by_key(|(_, width)| **width) else {
+            break;
+        };
+        if widths[index] == 0 {
+            break;
+        }
+        widths[index] -= 1;
+    }
+
+    labels
+        .iter()
+        .zip(widths)
+        .map(|(label, width)| truncate_tab_label(label, width))
+        .collect()
+}
+
+fn tab_min_width(label: &str, min_chars_before_ellipsis: usize) -> usize {
+    let len = label.chars().count();
+    if len <= min_chars_before_ellipsis {
+        len
+    } else {
+        min_chars_before_ellipsis.saturating_add(3)
+    }
+}
+
+fn truncate_tab_label(label: &str, width: usize) -> String {
+    let len = label.chars().count();
+    if len <= width {
+        return label.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut value = label.chars().take(width - 3).collect::<String>();
+    value.push_str("...");
+    value
+}
+
+fn render_side_panels(frame: &mut ratatui::Frame, render: SidePanelRender<'_>) {
+    let preview_focused = matches!(render.focus, Focus::Preview | Focus::TagEdit);
+    let git_focused = render.focus == Focus::Git;
+    let preview_border_style = if preview_focused {
+        Style::default().fg(render.accent)
+    } else {
+        Style::default().fg(render.text)
     };
     let git_border_style = if git_focused {
-        Style::default().fg(accent)
+        Style::default().fg(render.accent)
     } else {
-        Style::default().fg(text)
+        Style::default().fg(render.text)
     };
-    let preview_title = build_preview_title_line(preview_title, preview_focused, text);
+    let preview_title =
+        build_preview_title_line(render.preview_title, preview_focused, render.text);
 
-    if let Some(git) = git {
+    if let Some(git) = render.git {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
+            .split(render.area);
 
-        let preview_title = preview_title.clone();
-        let preview_paragraph = Paragraph::new(preview.clone())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(preview_title)
-                    .border_style(preview_border_style)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(text))
-            .alignment(Alignment::Left)
-            .scroll((preview_scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(preview_paragraph, chunks[0]);
+        render_preview_panel(
+            frame,
+            chunks[0],
+            &render,
+            preview_title.clone(),
+            preview_border_style,
+        );
 
         let git_title = if git_focused { "* Git" } else { "Git" };
-        let git_title = Span::styled(git_title, Style::default().fg(text));
+        let git_title = Span::styled(git_title, Style::default().fg(render.text));
         let git_paragraph = Paragraph::new(git.clone())
             .block(
                 Block::default()
@@ -2655,27 +3522,80 @@ fn render_side_panels(
                     .border_style(git_border_style)
                     .border_type(BorderType::Rounded),
             )
-            .style(Style::default().fg(text))
+            .style(Style::default().fg(render.text))
             .alignment(Alignment::Left)
-            .scroll((git_scroll, 0))
+            .scroll((render.git_scroll, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(git_paragraph, chunks[1]);
     } else {
-        let preview_title = preview_title.clone();
-        let preview_paragraph = Paragraph::new(preview.clone())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(preview_title)
-                    .border_style(preview_border_style)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(text))
-            .alignment(Alignment::Left)
-            .scroll((preview_scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(preview_paragraph, area);
+        render_preview_panel(
+            frame,
+            render.area,
+            &render,
+            preview_title.clone(),
+            preview_border_style,
+        );
     }
+}
+
+fn render_preview_panel(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    render: &SidePanelRender<'_>,
+    title: Line<'static>,
+    border_style: Style,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style)
+        .border_type(BorderType::Rounded);
+    let inner = panel_inner_area(area);
+    frame.render_widget(block, area);
+
+    let mut content_area = inner;
+    if render.preview_tab_labels.len() > 1 && inner.height > 0 {
+        let tab_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        content_area = preview_content_area(area, render.preview_tab_labels.len());
+        let (visible_labels, visible_index) = visible_tab_window(
+            render.preview_tab_labels,
+            render.preview_tab_index,
+            tab_area.width as usize,
+            render.preview_settings,
+        );
+        let titles = visible_labels
+            .iter()
+            .map(|label| {
+                Line::from(Span::styled(
+                    label.clone(),
+                    Style::default().fg(render.text),
+                ))
+            })
+            .collect::<Vec<Line<'static>>>();
+        let tabs = Tabs::new(titles)
+            .select(visible_index)
+            .divider(" | ")
+            .padding("", "")
+            .style(Style::default().fg(render.text))
+            .highlight_style(
+                Style::default()
+                    .fg(render.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(tabs, tab_area);
+    }
+
+    let preview_paragraph = Paragraph::new(render.preview.clone())
+        .style(Style::default().fg(render.text))
+        .alignment(Alignment::Left)
+        .scroll((render.preview_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(preview_paragraph, content_area);
 }
 
 struct TerminalGuard;
@@ -2693,4 +3613,198 @@ fn setup_terminal() -> AppResult<(Terminal<CrosstermBackend<io::Stderr>>, Termin
     let backend = CrosstermBackend::new(io::stderr());
     let terminal = Terminal::new(backend)?;
     Ok((terminal, TerminalGuard))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_git_worktree_porcelain_with_bare_and_branch_entries() {
+        let output = "worktree /repos/example.git\nbare\n\nworktree /repos/example\nHEAD 123456\nbranch refs/heads/main\n\nworktree /repos/example-feature\nHEAD abcdef\nbranch refs/heads/feature/worktree\n";
+
+        let worktrees = parse_git_worktree_list(output);
+
+        assert_eq!(worktrees.len(), 3);
+        assert_eq!(worktrees[0].path, "/repos/example.git");
+        assert!(worktrees[0].bare);
+        assert_eq!(worktrees[1].path, "/repos/example");
+        assert_eq!(worktrees[1].branch.as_deref(), Some("main"));
+        assert_eq!(worktrees[2].branch.as_deref(), Some("feature/worktree"));
+    }
+
+    #[test]
+    fn labels_detached_worktree_when_no_branch_is_reported() {
+        let output = "worktree /repos/example-detached\nHEAD abcdef\ndetached\n";
+
+        let worktrees = parse_git_worktree_list(output);
+
+        assert_eq!(worktrees.len(), 1);
+        assert!(worktrees[0].detached);
+        assert_eq!(git_worktree_label(&worktrees[0], true), "detached");
+    }
+
+    #[test]
+    fn shortens_worktree_tab_label_after_last_slash() {
+        assert_eq!(worktree_tab_label("feat/yarden/potato", true), "potato");
+        assert_eq!(
+            worktree_tab_label("feat/yarden/potato", false),
+            "feat/yarden/potato"
+        );
+    }
+
+    #[test]
+    fn pseudo_scrolls_tabs_from_previous_label() {
+        let labels = vec![
+            "main".to_string(),
+            "feature-1".to_string(),
+            "feature-2".to_string(),
+            "feature-3".to_string(),
+            "feature-4".to_string(),
+        ];
+
+        let settings = default_preview_settings();
+        let (first_visible, first_selected) = visible_tab_window(&labels, 0, 35, settings);
+        let (middle_visible, middle_selected) = visible_tab_window(&labels, 2, 40, settings);
+
+        assert_eq!(first_selected, 0);
+        assert_eq!(
+            first_visible,
+            vec!["main", "feature-1", "feature-2", "f..."]
+        );
+        assert_eq!(middle_selected, 1);
+        assert_eq!(
+            middle_visible,
+            vec!["feature-1", "feature-2", "feature-3", "f..."]
+        );
+    }
+
+    #[test]
+    fn truncates_long_tab_labels_with_ellipsis() {
+        assert_eq!(truncate_tab_label("very-long-feature", 10), "very-lo...");
+        assert_eq!(truncate_tab_label("abc", 10), "abc");
+        assert_eq!(truncate_tab_label("abcdef", 3), "...");
+    }
+
+    #[test]
+    fn keeps_more_selected_tab_chars_before_ellipsis() {
+        let labels = vec![
+            "previous-worktree".to_string(),
+            "selected-worktree".to_string(),
+            "next-worktree".to_string(),
+        ];
+        let settings = PreviewSettings {
+            shorten_worktree_tab_labels: true,
+            worktree_tab_min_chars: 6,
+            selected_worktree_tab_min_chars: 10,
+        };
+
+        let (visible, selected) = visible_tab_window(&labels, 1, 25, settings);
+
+        assert_eq!(selected, 1);
+        assert_eq!(visible, vec!["previo...", "selected-w..."]);
+    }
+
+    #[test]
+    fn enter_from_preview_returns_active_worktree_path() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "/repos/project.git".to_string(),
+            PreviewData {
+                previews: vec![
+                    PreviewTab {
+                        path: "/repos/project".to_string(),
+                        label: "main".to_string(),
+                        text: Text::default(),
+                        git: None,
+                    },
+                    PreviewTab {
+                        path: "/repos/project-feature".to_string(),
+                        label: "feature".to_string(),
+                        text: Text::default(),
+                        git: None,
+                    },
+                ],
+                selected_repo_is_bare: false,
+                git_loaded: false,
+            },
+        );
+
+        let value = enter_selection_path(Focus::Preview, Some("/repos/project.git"), 1, &cache);
+
+        assert_eq!(value.as_deref(), Some("/repos/project-feature"));
+        assert!(
+            enter_selection_path(Focus::Search, Some("/repos/project.git"), 1, &cache).is_none()
+        );
+    }
+
+    #[test]
+    fn applies_git_result_to_one_preview_tab() {
+        let mut data = PreviewData {
+            previews: vec![
+                PreviewTab {
+                    path: "/repos/project".to_string(),
+                    label: "main".to_string(),
+                    text: Text::default(),
+                    git: None,
+                },
+                PreviewTab {
+                    path: "/repos/project-feature".to_string(),
+                    label: "feature".to_string(),
+                    text: Text::default(),
+                    git: None,
+                },
+            ],
+            selected_repo_is_bare: true,
+            git_loaded: false,
+        };
+
+        apply_git_result(
+            &mut data,
+            1,
+            Some(Text::from(Line::from("Branch: feature"))),
+            false,
+        );
+
+        assert!(data.previews[0].git.is_none());
+        assert!(data.previews[1].git.is_some());
+        assert!(!data.git_loaded);
+    }
+
+    #[test]
+    fn displays_home_paths_with_tilde() {
+        assert_eq!(display_path_with_home("/Users/kcw", "/Users/kcw"), "~");
+        assert_eq!(
+            display_path_with_home("/Users/kcw/Github/navgator", "/Users/kcw"),
+            "~/Github/navgator"
+        );
+        assert_eq!(
+            display_path_with_home("/Users/kcw-other/Github", "/Users/kcw"),
+            "/Users/kcw-other/Github"
+        );
+    }
+
+    #[test]
+    fn resolves_dot_bare_worktree_container() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("navgator-dot-bare-test-{unique}"));
+        let dot_bare = root.join(".bare");
+        fs::create_dir_all(&root).expect("test root should be created");
+
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&dot_bare)
+            .status()
+            .expect("git should be available");
+        assert!(status.success());
+
+        let resolved = git_command_dir_for_path(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(resolved.as_deref(), Some(dot_bare.as_path()));
+    }
 }

@@ -97,9 +97,17 @@ Config format (TOML):
 [paths]
 index_folders = ["/Users/kcw/Github", "/Users/kcw/Desktop"]
 static_items = ["/opt/homebrew", "/Users/kcw/Downloads"]
+
+[preview]
+shorten_worktree_tab_labels = true
+worktree_tab_min_chars = 6
+selected_worktree_tab_min_chars = 10
 ```
 
 If an existing config contains `[paths]` but no `"$schema"`, navgator prepends this line automatically when loading that config.
+
+`shorten_worktree_tab_labels` defaults to `true`; worktree branch labels like `feat/yarden/potato` render as `potato` in preview tabs. Set it to `false` to show full labels.
+`worktree_tab_min_chars` defaults to `6`; `selected_worktree_tab_min_chars` defaults to `10`. These control how many label characters are kept before `...` when worktree preview tabs must shrink.
 
 Schema file is generated from the Rust config structs:
 
