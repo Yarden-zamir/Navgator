@@ -1,57 +1,5 @@
+use crate::model::{MatchScore, SortMeta, SortMode};
 use std::{cmp::Ordering, collections::HashMap, path::Path};
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct SortMeta {
-    pub(crate) modified_epoch: Option<i64>,
-    pub(crate) created_epoch: Option<i64>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SortMode {
-    Match,
-    AlphaAsc,
-    AlphaDesc,
-    CreatedAsc,
-    CreatedDesc,
-    ModifiedAsc,
-    ModifiedDesc,
-}
-
-impl SortMode {
-    pub(crate) fn next(self) -> Self {
-        match self {
-            SortMode::Match => SortMode::AlphaAsc,
-            SortMode::AlphaAsc => SortMode::AlphaDesc,
-            SortMode::AlphaDesc => SortMode::CreatedAsc,
-            SortMode::CreatedAsc => SortMode::CreatedDesc,
-            SortMode::CreatedDesc => SortMode::ModifiedAsc,
-            SortMode::ModifiedAsc => SortMode::ModifiedDesc,
-            SortMode::ModifiedDesc => SortMode::Match,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            SortMode::Match => "Match",
-            SortMode::AlphaAsc => "A->Z",
-            SortMode::AlphaDesc => "Z->A",
-            SortMode::CreatedAsc => "Created ^",
-            SortMode::CreatedDesc => "Created v",
-            SortMode::ModifiedAsc => "Modified ^",
-            SortMode::ModifiedDesc => "Modified v",
-        }
-    }
-
-    pub(crate) fn uses_time(self) -> bool {
-        matches!(
-            self,
-            SortMode::CreatedAsc
-                | SortMode::CreatedDesc
-                | SortMode::ModifiedAsc
-                | SortMode::ModifiedDesc
-        )
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct QueryTokens {
@@ -120,26 +68,6 @@ pub(crate) fn entry_name(path: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn fuzzy_match(query: &str, text: &str) -> bool {
-    let mut chars = query.chars().filter(|c| !c.is_whitespace());
-    let mut current = chars.next();
-    if current.is_none() {
-        return true;
-    }
-
-    for t in text.chars() {
-        if let Some(q) = current {
-            if q.eq_ignore_ascii_case(&t) {
-                current = chars.next();
-                if current.is_none() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 fn filter_indices(
     items: &[String],
     query: &str,
@@ -152,9 +80,9 @@ fn filter_indices(
     items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| {
-            let tags = tag_cache.get(item).map(Vec::as_slice).unwrap_or(&[]);
-            if matches_tokens(item, tags, &tokens) {
+        .filter_map(|(index, path)| {
+            let tags = tag_cache.get(path).map(Vec::as_slice).unwrap_or(&[]);
+            if matches_tokens(path, tags, &tokens) {
                 Some(index)
             } else {
                 None
@@ -172,7 +100,7 @@ fn filter_and_sort_by_match(
     if tokens.is_empty() {
         return (0..items.len()).collect();
     }
-    let mut scored: Vec<(usize, (usize, usize, usize, usize, usize))> = Vec::new();
+    let mut scored: Vec<(usize, MatchScore)> = Vec::new();
     for (index, path) in items.iter().enumerate() {
         let tags = tag_cache.get(path).map(Vec::as_slice).unwrap_or(&[]);
         if !matches_tokens(path, tags, &tokens) {
@@ -182,7 +110,12 @@ fn filter_and_sort_by_match(
             scored.push((index, score));
         }
     }
-    scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    scored.sort_by(|(left_idx, left), (right_idx, right)| {
+        left.cmp(right).then_with(|| {
+            compare_names(&items[*left_idx], &items[*right_idx])
+                .then_with(|| left_idx.cmp(right_idx))
+        })
+    });
     scored.into_iter().map(|(index, _)| index).collect()
 }
 
@@ -192,21 +125,18 @@ fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
             return false;
         }
     }
-
     for token in &tokens.tags {
         if !tags.iter().any(|tag| fuzzy_match(token, tag)) {
             return false;
         }
     }
-
     for token in &tokens.any {
         let path_match = matches_path_token(token, path);
         let tag_match = tags.iter().any(|tag| fuzzy_match(token, tag));
-        if !(path_match || tag_match) {
+        if !path_match && !tag_match {
             return false;
         }
     }
-
     true
 }
 
@@ -215,11 +145,7 @@ fn matches_path_token(token: &str, path: &str) -> bool {
     fuzzy_match(token, &entry) || fuzzy_match(token, path)
 }
 
-fn match_score_tokens(
-    tokens: &QueryTokens,
-    path: &str,
-    tags: &[String],
-) -> Option<(usize, usize, usize, usize, usize)> {
+fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Option<MatchScore> {
     let mut penalty_sum = 0usize;
     let mut span_sum = 0usize;
     let mut gap_sum = 0usize;
@@ -228,47 +154,45 @@ fn match_score_tokens(
 
     for token in &tokens.folder {
         let score = match_score_for_path(token, path)?;
-        penalty_sum = penalty_sum.saturating_add(score.0);
-        span_sum = span_sum.saturating_add(score.1);
-        gap_sum = gap_sum.saturating_add(score.2);
-        start_sum = start_sum.saturating_add(score.3);
-        len_sum = len_sum.saturating_add(score.4);
+        penalty_sum += score.0;
+        span_sum += score.1;
+        gap_sum += score.2;
+        start_sum += score.3;
+        len_sum += score.4;
     }
-
     for token in &tokens.tags {
         let score = best_tag_score(token, tags)?;
-        penalty_sum = penalty_sum.saturating_add(score.0);
-        span_sum = span_sum.saturating_add(score.1);
-        gap_sum = gap_sum.saturating_add(score.2);
-        start_sum = start_sum.saturating_add(score.3);
-        len_sum = len_sum.saturating_add(score.4);
+        penalty_sum += score.0;
+        span_sum += score.1;
+        gap_sum += score.2;
+        start_sum += score.3;
+        len_sum += score.4;
     }
-
     for token in &tokens.any {
-        let mut best = match_score_for_path(token, path);
-        if let Some(tag_score) = best_tag_score(token, tags) {
-            best = match best {
-                Some(path_score) => Some(path_score.min(tag_score)),
-                None => Some(tag_score),
-            };
-        }
-        let score = best?;
-        penalty_sum = penalty_sum.saturating_add(score.0);
-        span_sum = span_sum.saturating_add(score.1);
-        gap_sum = gap_sum.saturating_add(score.2);
-        start_sum = start_sum.saturating_add(score.3);
-        len_sum = len_sum.saturating_add(score.4);
+        let path_score = match_score_for_path(token, path);
+        let tag_score = best_tag_score(token, tags);
+        let score = match (path_score, tag_score) {
+            (Some(path), Some(tag)) => path.min(tag),
+            (Some(path), None) => path,
+            (None, Some(tag)) => tag,
+            (None, None) => return None,
+        };
+        penalty_sum += score.0;
+        span_sum += score.1;
+        gap_sum += score.2;
+        start_sum += score.3;
+        len_sum += score.4;
     }
 
     Some((penalty_sum, span_sum, gap_sum, start_sum, len_sum))
 }
 
-fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, usize, usize)> {
-    let mut best: Option<(usize, usize, usize, usize, usize)> = None;
+fn best_tag_score(token: &str, tags: &[String]) -> Option<MatchScore> {
+    let mut best: Option<MatchScore> = None;
     for tag in tags {
         if let Some(score) = match_score(token, tag) {
             best = match best {
-                Some(current) => Some(current.min(score)),
+                Some(existing) => Some(existing.min(score)),
                 None => Some(score),
             };
         }
@@ -276,21 +200,14 @@ fn best_tag_score(token: &str, tags: &[String]) -> Option<(usize, usize, usize, 
     best
 }
 
-fn match_score_for_path(token: &str, path: &str) -> Option<(usize, usize, usize, usize, usize)> {
+fn match_score_for_path(token: &str, path: &str) -> Option<MatchScore> {
     let entry = entry_name(path);
     if let Some(score) = match_score(token, &entry) {
         return Some(score);
     }
-    if let Some(score) = match_score(token, path) {
-        return Some((
-            score.0.saturating_add(2),
-            score.1,
-            score.2,
-            score.3,
-            score.4,
-        ));
-    }
-    None
+    let mut score = match_score(token, path)?;
+    score.0 += 1;
+    Some(score)
 }
 
 fn sort_indices(
@@ -299,7 +216,7 @@ fn sort_indices(
     sort_mode: SortMode,
     meta_cache: &HashMap<String, SortMeta>,
 ) {
-    indices.sort_by(|a, b| compare_indices(*a, *b, items, sort_mode, meta_cache));
+    indices.sort_by(|left, right| compare_indices(*left, *right, items, sort_mode, meta_cache));
 }
 
 fn compare_indices(
@@ -311,66 +228,97 @@ fn compare_indices(
 ) -> Ordering {
     let left_path = &items[left];
     let right_path = &items[right];
-
     match sort_mode {
-        SortMode::Match => compare_names(left_path, right_path),
-        SortMode::AlphaAsc => compare_names(left_path, right_path),
-        SortMode::AlphaDesc => compare_names(right_path, left_path),
-        SortMode::CreatedAsc => compare_time(left_path, right_path, meta_cache, TimeField::Created)
-            .then_with(|| compare_names(left_path, right_path)),
+        SortMode::Match => Ordering::Equal,
+        SortMode::AlphaAsc => compare_names(left_path, right_path).then_with(|| left.cmp(&right)),
+        SortMode::AlphaDesc => compare_names(right_path, left_path).then_with(|| left.cmp(&right)),
+        SortMode::CreatedAsc => {
+            compare_time(left_path, right_path, meta_cache, TimeField::Created, false)
+                .then_with(|| compare_names(left_path, right_path))
+        }
         SortMode::CreatedDesc => {
-            compare_time(right_path, left_path, meta_cache, TimeField::Created)
+            compare_time(left_path, right_path, meta_cache, TimeField::Created, true)
                 .then_with(|| compare_names(left_path, right_path))
         }
-        SortMode::ModifiedAsc => {
-            compare_time(left_path, right_path, meta_cache, TimeField::Modified)
-                .then_with(|| compare_names(left_path, right_path))
-        }
+        SortMode::ModifiedAsc => compare_time(
+            left_path,
+            right_path,
+            meta_cache,
+            TimeField::Modified,
+            false,
+        )
+        .then_with(|| compare_names(left_path, right_path)),
         SortMode::ModifiedDesc => {
-            compare_time(right_path, left_path, meta_cache, TimeField::Modified)
+            compare_time(left_path, right_path, meta_cache, TimeField::Modified, true)
                 .then_with(|| compare_names(left_path, right_path))
         }
     }
 }
 
 fn compare_names(left: &str, right: &str) -> Ordering {
-    let left_name = entry_name(left).to_lowercase();
-    let right_name = entry_name(right).to_lowercase();
-    left_name.cmp(&right_name).then_with(|| left.cmp(right))
+    entry_name(left)
+        .to_lowercase()
+        .cmp(&entry_name(right).to_lowercase())
 }
 
-#[derive(Clone, Copy)]
 enum TimeField {
     Created,
     Modified,
 }
 
 fn compare_time(
-    left: &str,
-    right: &str,
+    left_path: &str,
+    right_path: &str,
     meta_cache: &HashMap<String, SortMeta>,
     field: TimeField,
+    descending: bool,
 ) -> Ordering {
-    let left_meta = meta_cache.get(left).copied().unwrap_or_default();
-    let right_meta = meta_cache.get(right).copied().unwrap_or_default();
-    let left_time = match field {
-        TimeField::Created => left_meta.created_epoch,
-        TimeField::Modified => left_meta.modified_epoch,
-    };
-    let right_time = match field {
-        TimeField::Created => right_meta.created_epoch,
-        TimeField::Modified => right_meta.modified_epoch,
+    let value = |path: &str| -> Option<i64> {
+        let meta = meta_cache.get(path)?;
+        match field {
+            TimeField::Created => meta.created_epoch,
+            TimeField::Modified => meta.modified_epoch,
+        }
     };
 
-    match (left_time, right_time) {
-        (Some(left_value), Some(right_value)) => left_value.cmp(&right_value),
+    let left_value = value(left_path);
+    let right_value = value(right_path);
+    let ordering = match (left_value, right_value) {
+        (Some(left), Some(right)) => left.cmp(&right),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
+    };
+    if descending {
+        ordering.reverse()
+    } else {
+        ordering
     }
 }
 
-fn match_score(query: &str, text: &str) -> Option<(usize, usize, usize, usize, usize)> {
+pub(crate) fn fuzzy_match(query: &str, text: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut query_chars = query.chars().filter(|c| !c.is_whitespace());
+    let mut current = query_chars.next();
+    if current.is_none() {
+        return true;
+    }
+    for ch in text.chars() {
+        if let Some(expected) = current {
+            if expected.eq_ignore_ascii_case(&ch) {
+                current = query_chars.next();
+                if current.is_none() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn match_score(query: &str, text: &str) -> Option<MatchScore> {
     let qchars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
     if qchars.is_empty() {
         return Some((0, 0, 0, 0, text.chars().count()));

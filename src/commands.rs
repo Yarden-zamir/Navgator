@@ -45,3 +45,16 @@ pub(crate) fn run_git_command_allow_empty(repo_dir: &Path, args: &[&str]) -> Opt
             .to_string(),
     )
 }
+
+pub(crate) fn git_command_succeeds(repo_dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("-c")
+        .arg("color.ui=never")
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}

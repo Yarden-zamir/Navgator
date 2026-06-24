@@ -1,12 +1,61 @@
+use crate::model::{AppResult, TagResult};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
+    sync::mpsc,
+    thread,
 };
-
 use tui_input::Input;
 
-use crate::AppResult;
+pub(crate) fn ensure_tags_for_paths(
+    paths: &[String],
+    cache: &HashMap<String, Vec<String>>,
+    in_flight: &mut HashSet<String>,
+    tx: &mpsc::Sender<TagResult>,
+) {
+    for path in paths {
+        if cache.contains_key(path) || in_flight.contains(path) {
+            continue;
+        }
+        in_flight.insert(path.clone());
+        let path_owned = path.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let tags = read_tags_for_path(&path_owned);
+            let _ = tx.send(TagResult {
+                path: path_owned,
+                tags,
+            });
+        });
+    }
+}
+
+pub(crate) fn spawn_bulk_tag_fetch(
+    items: &[String],
+    cache: &HashMap<String, Vec<String>>,
+    in_flight: &mut HashSet<String>,
+    tx: &mpsc::Sender<TagResult>,
+) {
+    let mut missing = Vec::new();
+    for path in items {
+        if cache.contains_key(path) || in_flight.contains(path) {
+            continue;
+        }
+        in_flight.insert(path.clone());
+        missing.push(path.clone());
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let tx = tx.clone();
+    thread::spawn(move || {
+        for path in missing {
+            let tags = read_tags_for_path(&path);
+            let _ = tx.send(TagResult { path, tags });
+        }
+    });
+}
 
 pub(crate) fn read_tags_for_path(path: &str) -> Vec<String> {
     let dir = Path::new(path);
@@ -116,7 +165,7 @@ fn extract_quoted_strings(value: &str) -> Vec<String> {
     while let Some(ch) = chars.next() {
         if ch == '"' {
             let mut text = String::new();
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == '"' {
                     break;
                 }

@@ -2,8 +2,8 @@
 
 ## Project Shape
 
-- Single Rust binary crate; Cargo only builds `src/main.rs` because it declares no `mod` files.
-- Files such as `src/config.rs`, `src/navigate.rs`, `src/preview.rs`, `src/search.rs`, `src/tags.rs`, and `src/ui.rs` currently are not wired into the binary. Verify `mod` declarations before editing them for behavior changes.
+- Single Rust binary crate with active modules wired from `src/main.rs`; do not add duplicate inactive split modules.
+- Current split: `config.rs` (config/schema), `results.rs` (project results), `metadata.rs` (date metadata), `tags.rs` (local tag metadata/actions), `git.rs` (Git/worktree service), `content.rs` (folder/worktree/Git content providers), `ui.rs` (layout/rendering/tab composition), `search.rs` (query/filter/sort), `commands.rs` (external command helpers), and `model.rs` (shared types/provider-model scaffolding).
 - Runtime entrypoints: `navgator` and `navgator navigate` run the TUI; `navgator config-schema`/`schema` prints JSON schema.
 
 ## Commands

@@ -1,30 +1,115 @@
+use crate::metadata::format_date_display;
+use crate::model::{
+    Focus, HelpColors, HelpContext, PreviewSettings, SidePanelRender, UiLayout, VisibleListArgs,
+    DATE_PLACEHOLDER, MIN_PARTIAL_TAB_WIDTH, TAB_DIVIDER_WIDTH,
+};
+use crate::search::{entry_name, fuzzy_match, QueryTokens};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, ListItem, Paragraph, Tabs, Wrap},
 };
 use tui_input::Input;
 
-use crate::search::SortMode;
+pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<'static> {
+    let key_style = Style::default()
+        .fg(colors.key_color)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default()
+        .fg(colors.accent)
+        .add_modifier(Modifier::BOLD);
+    let regular_style = Style::default().fg(colors.text);
+    let mut spans: Vec<Span> = Vec::new();
+    let has_prev_preview = context.preview_tab_index > 0;
+    let has_next_preview = context.preview_tab_index + 1 < context.preview_tab_count;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Focus {
-    Search,
-    Preview,
-    Git,
-    TagEdit,
-}
+    match context.focus {
+        Focus::Search => {
+            spans.push(Span::styled("Search", label_style));
+            spans.push(Span::styled("  ", regular_style));
+            if context.cursor_at_end {
+                spans.push(Span::styled("Right", key_style));
+                spans.push(Span::styled(" preview  ", regular_style));
+            }
+            spans.push(Span::styled("Ctrl+T", key_style));
+            spans.push(Span::styled(" tag  ", regular_style));
+            spans.push(Span::styled("Ctrl+S", key_style));
+            spans.push(Span::styled(
+                format!(" {}  ", context.sort_mode.label()),
+                regular_style,
+            ));
+            spans.push(Span::styled("Ctrl+U", key_style));
+            spans.push(Span::styled(" clear", regular_style));
+        }
+        Focus::Preview => {
+            let label = if context.preview_tab_count > 1 {
+                format!(
+                    "Preview {}/{}",
+                    context.preview_tab_index + 1,
+                    context.preview_tab_count
+                )
+            } else {
+                "Preview".to_string()
+            };
+            spans.push(Span::styled(label, label_style));
+            spans.push(Span::styled("  ", regular_style));
+            spans.push(Span::styled("Left", key_style));
+            if has_prev_preview {
+                spans.push(Span::styled(" prev  ", regular_style));
+            } else {
+                spans.push(Span::styled(" search  ", regular_style));
+            }
+            if has_next_preview {
+                spans.push(Span::styled("Right", key_style));
+                spans.push(Span::styled(" next  ", regular_style));
+            } else if context.show_git {
+                spans.push(Span::styled("Right", key_style));
+                spans.push(Span::styled(" git  ", regular_style));
+            }
+            spans.push(Span::styled("Ctrl+T", key_style));
+            spans.push(Span::styled(" tag  ", regular_style));
+            if context.preview_scroll == 0 && !has_prev_preview {
+                spans.push(Span::styled("Up", key_style));
+                spans.push(Span::styled(" search  ", regular_style));
+            }
+            if has_next_preview && context.preview_scroll >= context.preview_max_scroll {
+                spans.push(Span::styled("Down", key_style));
+                spans.push(Span::styled(" next", regular_style));
+            } else if context.show_git && context.preview_scroll >= context.preview_max_scroll {
+                spans.push(Span::styled("Down", key_style));
+                spans.push(Span::styled(" git", regular_style));
+            }
+        }
+        Focus::Git => {
+            spans.push(Span::styled("Git", label_style));
+            spans.push(Span::styled("  ", regular_style));
+            spans.push(Span::styled("Left", key_style));
+            spans.push(Span::styled(" preview  ", regular_style));
+            spans.push(Span::styled("Right", key_style));
+            spans.push(Span::styled(" preview  ", regular_style));
+            spans.push(Span::styled("Ctrl+T", key_style));
+            spans.push(Span::styled(" tag  ", regular_style));
+            if context.git_scroll == 0 {
+                spans.push(Span::styled("Up", key_style));
+                spans.push(Span::styled(" preview", regular_style));
+            }
+        }
+        Focus::TagEdit => {
+            spans.push(Span::styled("Tag", label_style));
+            spans.push(Span::styled("  ", regular_style));
+            spans.push(Span::styled("Tab", key_style));
+            spans.push(Span::styled(" add  ", regular_style));
+            spans.push(Span::styled("Enter", key_style));
+            if context.has_tag_input {
+                spans.push(Span::styled(" add+done", regular_style));
+            } else {
+                spans.push(Span::styled(" done", regular_style));
+            }
+        }
+    }
 
-#[derive(Clone, Copy)]
-pub(crate) struct UiLayout {
-    pub(crate) list_area: Rect,
-    pub(crate) detail_area: Rect,
-    pub(crate) search_area: Rect,
-    pub(crate) results_area: Rect,
-    pub(crate) preview_area: Rect,
-    pub(crate) git_area: Option<Rect>,
-    pub(crate) help_area: Rect,
+    Line::from(spans)
 }
 
 pub(crate) fn compute_ui_layout(size: Rect, show_git: bool) -> UiLayout {
@@ -78,6 +163,15 @@ pub(crate) fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
+pub(crate) fn preview_content_area(area: Rect, tab_count: usize) -> Rect {
+    let mut inner = panel_inner_area(area);
+    if tab_count > 1 && inner.height > 0 {
+        inner.y = inner.y.saturating_add(1);
+        inner.height = inner.height.saturating_sub(1);
+    }
+    inner
+}
+
 pub(crate) fn text_line_count(text: &Text) -> usize {
     text.lines.len()
 }
@@ -86,142 +180,463 @@ pub(crate) fn input_at_end(input: &Input) -> bool {
     input.cursor() >= input.value().chars().count()
 }
 
-pub(crate) fn build_help_line(
-    focus: Focus,
-    sort_mode: SortMode,
-    show_git: bool,
-    cursor_at_end: bool,
-    has_tag_input: bool,
-    preview_scroll: usize,
-    preview_max_scroll: usize,
-    git_scroll: usize,
-    text: Color,
-    accent: Color,
-    key_color: Color,
-) -> Line<'static> {
-    let key_style = Style::default().fg(key_color).add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let regular_style = Style::default().fg(text);
-    let mut spans: Vec<Span> = Vec::new();
+pub(crate) fn build_visible_list_items(
+    args: VisibleListArgs<'_>,
+) -> (Vec<ListItem<'static>>, Option<usize>) {
+    if args.filtered.is_empty() || args.height == 0 {
+        let item = ListItem::new(Line::from(Span::styled(
+            "No matches",
+            Style::default().fg(args.muted),
+        )));
+        return (vec![item], None);
+    }
 
-    match focus {
-        Focus::Search => {
-            spans.push(Span::styled("Search", label_style));
-            spans.push(Span::styled("  ", regular_style));
-            if cursor_at_end {
-                spans.push(Span::styled("Right", key_style));
-                spans.push(Span::styled(" preview  ", regular_style));
-            }
-            spans.push(Span::styled("Ctrl+T", key_style));
-            spans.push(Span::styled(" tag  ", regular_style));
-            spans.push(Span::styled("Ctrl+S", key_style));
-            spans.push(Span::styled(
-                format!(" {}  ", sort_mode.label()),
-                regular_style,
-            ));
-            spans.push(Span::styled("Ctrl+U", key_style));
-            spans.push(Span::styled(" clear", regular_style));
+    let end = (args.offset + args.height).min(args.filtered.len());
+    let visible = &args.filtered[args.offset..end];
+    let mut list_items = Vec::with_capacity(visible.len());
+
+    for item_index in visible.iter() {
+        let path = &args.items[*item_index];
+        let entry = entry_name(path);
+        let date_value = args
+            .dates
+            .get(path)
+            .map(String::as_str)
+            .unwrap_or(DATE_PLACEHOLDER);
+        let date_display = format_date_display(date_value);
+        let date_len = date_display.chars().count();
+        let tag_list = args.tags.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let max_entry = args.inner_width.saturating_sub(date_len + 1);
+        let mut entry_display = truncate_with_ellipsis(&entry, max_entry);
+        let mut entry_len = entry_display.chars().count();
+        if entry_len + date_len + 1 > args.inner_width {
+            let new_len = args.inner_width.saturating_sub(date_len + 1);
+            entry_display = truncate_with_ellipsis(&entry, new_len);
+            entry_len = entry_display.chars().count();
         }
-        Focus::Preview => {
-            spans.push(Span::styled("Preview", label_style));
-            spans.push(Span::styled("  ", regular_style));
-            spans.push(Span::styled("Left", key_style));
-            spans.push(Span::styled(" search  ", regular_style));
-            if show_git {
-                spans.push(Span::styled("Right", key_style));
-                spans.push(Span::styled(" git  ", regular_style));
-            }
-            spans.push(Span::styled("Ctrl+T", key_style));
-            spans.push(Span::styled(" tag  ", regular_style));
-            if preview_scroll == 0 {
-                spans.push(Span::styled("Up", key_style));
-                spans.push(Span::styled(" search  ", regular_style));
-            }
-            if show_git && preview_scroll >= preview_max_scroll {
-                spans.push(Span::styled("Down", key_style));
-                spans.push(Span::styled(" git", regular_style));
-            }
+
+        let remaining = args.inner_width.saturating_sub(entry_len + date_len);
+        let tag_space = remaining.saturating_sub(1);
+        let (tag_spans, tag_len) = if tag_space > 0 {
+            build_tag_spans(tag_list, args.tokens, tag_space, args.elapsed_ms, args.text)
+        } else {
+            (Vec::new(), 0)
+        };
+        let tag_block_len = if tag_len > 0 { tag_len + 1 } else { 0 };
+        let right_block_len = date_len + tag_block_len;
+        let padding = args.inner_width.saturating_sub(entry_len + right_block_len);
+        let mut spans = Vec::new();
+        spans.push(Span::styled(entry_display, Style::default().fg(args.text)));
+        spans.push(Span::raw(" ".repeat(padding)));
+        if tag_len > 0 {
+            spans.push(Span::raw(" "));
+            spans.extend(tag_spans);
         }
-        Focus::Git => {
-            spans.push(Span::styled("Git", label_style));
-            spans.push(Span::styled("  ", regular_style));
-            spans.push(Span::styled("Left", key_style));
-            spans.push(Span::styled(" search  ", regular_style));
-            spans.push(Span::styled("Right", key_style));
-            spans.push(Span::styled(" preview  ", regular_style));
-            spans.push(Span::styled("Ctrl+T", key_style));
-            spans.push(Span::styled(" tag  ", regular_style));
-            if git_scroll == 0 {
-                spans.push(Span::styled("Up", key_style));
-                spans.push(Span::styled(" preview", regular_style));
-            }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(date_display, Style::default().fg(args.muted)));
+        let line = Line::from(spans);
+        list_items.push(ListItem::new(line));
+    }
+
+    let list_selected = args.selected.checked_sub(args.offset);
+    (list_items, list_selected)
+}
+
+pub(crate) fn compose_preview_text_with_input(
+    base: &Text<'static>,
+    tags: &[String],
+    input: &Input,
+    width: usize,
+    text: Color,
+) -> (Text<'static>, Option<(usize, usize)>) {
+    let tag_lines = build_full_tag_lines(tags, width, text);
+    let input_line_index = tag_lines.len();
+    let scroll = input.visual_scroll(width.max(1));
+    let input_slice = substring_by_char(input.value(), scroll, width.max(1));
+    let input_line = Line::from(Span::styled(input_slice, Style::default().fg(text)));
+    let cursor_col = input.visual_cursor().max(scroll).saturating_sub(scroll);
+
+    let mut lines = Vec::new();
+    lines.extend(tag_lines);
+    lines.push(input_line);
+    lines.push(Line::from(""));
+    lines.extend(base.lines.clone());
+    let cursor = Some((input_line_index, cursor_col));
+    (Text::from(lines), cursor)
+}
+
+pub(crate) fn compose_preview_text(
+    base: &Text<'static>,
+    tags: &[String],
+    width: usize,
+    text: Color,
+) -> Text<'static> {
+    if tags.is_empty() {
+        return base.clone();
+    }
+
+    let tag_lines = build_full_tag_lines(tags, width, text);
+    if tag_lines.is_empty() {
+        return base.clone();
+    }
+
+    let mut lines = Vec::new();
+    lines.extend(tag_lines);
+    lines.push(Line::from(""));
+    lines.extend(base.lines.clone());
+    Text::from(lines)
+}
+
+pub(crate) fn visible_tab_window(
+    labels: &[String],
+    selected: usize,
+    width: usize,
+    settings: PreviewSettings,
+) -> (Vec<String>, usize) {
+    if labels.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let selected = selected.min(labels.len() - 1);
+    if width == 0 {
+        return (vec![labels[selected].clone()], 0);
+    }
+
+    let mut start = selected.saturating_sub(1);
+    let mut count = labels.len() - start;
+    let selected_offset = selected - start;
+    let selected_only_count = selected_offset + 1;
+    let preferred_count = if selected + 1 < labels.len() {
+        selected_offset + 2
+    } else {
+        selected_only_count
+    };
+
+    while count > preferred_count
+        && min_tab_window_width(&labels[start..start + count], selected - start, settings) > width
+    {
+        count -= 1;
+    }
+    while count > selected_only_count
+        && min_tab_window_width(&labels[start..start + count], selected - start, settings) > width
+    {
+        count -= 1;
+    }
+    if min_tab_window_width(&labels[start..start + count], selected - start, settings) > width
+        && selected > start
+    {
+        start = selected;
+        count = 1;
+    }
+
+    let selected_index = selected - start;
+    let mut visible = fit_tab_labels(
+        &labels[start..start + count],
+        selected_index,
+        width,
+        settings,
+    );
+    let next_index = start + count;
+    if next_index < labels.len() {
+        let used = rendered_tab_width(&visible);
+        let partial_width = width.saturating_sub(used.saturating_add(TAB_DIVIDER_WIDTH));
+        if partial_width >= MIN_PARTIAL_TAB_WIDTH {
+            visible.push(truncate_tab_label(&labels[next_index], partial_width));
         }
-        Focus::TagEdit => {
-            spans.push(Span::styled("Tag", label_style));
-            spans.push(Span::styled("  ", regular_style));
-            spans.push(Span::styled("Tab", key_style));
-            spans.push(Span::styled(" add  ", regular_style));
-            spans.push(Span::styled("Enter", key_style));
-            if has_tag_input {
-                spans.push(Span::styled(" add+done", regular_style));
+    }
+
+    (visible, selected_index)
+}
+
+pub(crate) fn truncate_tab_label(label: &str, width: usize) -> String {
+    let len = label.chars().count();
+    if len <= width {
+        return label.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut value = label.chars().take(width - 3).collect::<String>();
+    value.push_str("...");
+    value
+}
+
+fn truncate_with_ellipsis(value: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let count = value.chars().count();
+    if count <= max {
+        return value.to_string();
+    }
+    if max <= 3 {
+        return value.chars().take(max).collect();
+    }
+    let trimmed: String = value.chars().take(max - 3).collect();
+    format!("{}...", trimmed)
+}
+
+fn build_tag_spans(
+    tags: &[String],
+    tokens: &QueryTokens,
+    max_width: usize,
+    elapsed_ms: u64,
+    text: Color,
+) -> (Vec<Span<'static>>, usize) {
+    if tags.is_empty() || max_width == 0 {
+        return (Vec::new(), 0);
+    }
+
+    let mut ordered = Vec::new();
+    let mut matching = Vec::new();
+    let mut non_matching = Vec::new();
+    if tokens.tags.is_empty() {
+        ordered.extend_from_slice(tags);
+    } else {
+        for tag in tags {
+            if tokens.tags.iter().any(|token| fuzzy_match(token, tag)) {
+                matching.push(tag.clone());
             } else {
-                spans.push(Span::styled(" done", regular_style));
+                non_matching.push(tag.clone());
+            }
+        }
+        ordered.extend_from_slice(&matching);
+        ordered.extend_from_slice(&non_matching);
+    }
+    let has_tag_query_match = !matching.is_empty();
+
+    let segments = build_tag_segments(&ordered, text);
+    let total_len = segments_total_len(&segments);
+    let display_width = max_width.max(1);
+    let scroll_enabled =
+        total_len > display_width && !has_tag_query_match && tokens.tags.is_empty();
+
+    if scroll_enabled && total_len > display_width {
+        let max_offset = total_len.saturating_sub(display_width);
+        let offset = ((elapsed_ms / 200) as usize) % (max_offset + 1);
+        return slice_tag_segments(&segments, offset, display_width);
+    }
+
+    let (spans, used) = slice_tag_segments(&segments, 0, display_width.min(total_len));
+    if used < total_len {
+        let more = "[...]";
+        let more_len = more.chars().count();
+        let extra = if spans.is_empty() { 0 } else { 1 };
+        if used + extra + more_len <= display_width {
+            let mut spans = spans;
+            if extra > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                more,
+                Style::default().fg(text).add_modifier(Modifier::ITALIC),
+            ));
+            return (spans, used + extra + more_len);
+        }
+    }
+
+    (spans, used)
+}
+
+#[derive(Clone)]
+struct TagSegment {
+    text: String,
+    style: Style,
+    len: usize,
+}
+
+fn build_tag_segments(tags: &[String], fallback: Color) -> Vec<TagSegment> {
+    let mut segments = Vec::new();
+    for (index, tag) in tags.iter().enumerate() {
+        if index > 0 {
+            segments.push(TagSegment {
+                text: " ".to_string(),
+                style: Style::default().fg(fallback),
+                len: 1,
+            });
+        }
+        let pill = format!("[{}]", tag);
+        let color = tag_color(tag, fallback);
+        let style = Style::default().fg(color).add_modifier(Modifier::ITALIC);
+        segments.push(TagSegment {
+            text: pill.clone(),
+            style,
+            len: pill.chars().count(),
+        });
+    }
+    segments
+}
+
+fn segments_total_len(segments: &[TagSegment]) -> usize {
+    segments.iter().map(|seg| seg.len).sum()
+}
+
+fn slice_tag_segments(
+    segments: &[TagSegment],
+    offset: usize,
+    width: usize,
+) -> (Vec<Span<'static>>, usize) {
+    let mut spans = Vec::new();
+    if width == 0 {
+        return (spans, 0);
+    }
+    let mut skipped = 0usize;
+    let mut remaining = width;
+    for seg in segments {
+        if remaining == 0 {
+            break;
+        }
+        if skipped + seg.len <= offset {
+            skipped += seg.len;
+            continue;
+        }
+        let start = offset.saturating_sub(skipped);
+        let take = remaining.min(seg.len.saturating_sub(start));
+        let slice = substring_by_char(&seg.text, start, take);
+        spans.push(Span::styled(slice, seg.style));
+        remaining = remaining.saturating_sub(take);
+        skipped += seg.len;
+    }
+    (spans, width.saturating_sub(remaining))
+}
+
+fn substring_by_char(value: &str, start: usize, len: usize) -> String {
+    if len == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx < start {
+            continue;
+        }
+        if idx >= start + len {
+            break;
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn build_full_tag_lines(tags: &[String], width: usize, text: Color) -> Vec<Line<'static>> {
+    if tags.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let segments = build_tag_segments(tags, text);
+    wrap_tag_segments(&segments, width)
+}
+
+fn wrap_tag_segments(segments: &[TagSegment], width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_len = 0usize;
+
+    for seg in segments {
+        if seg.len == 0 {
+            continue;
+        }
+        let mut offset = 0usize;
+        while offset < seg.len {
+            if current_len == 0 && seg.text.starts_with(' ') {
+                offset = offset.saturating_add(1);
+                continue;
+            }
+            let available = width.saturating_sub(current_len).max(1);
+            let remaining = seg.len.saturating_sub(offset);
+            let take = remaining.min(available);
+            let slice = substring_by_char(&seg.text, offset, take);
+            current.push(Span::styled(slice, seg.style));
+            current_len = current_len.saturating_add(take);
+            offset = offset.saturating_add(take);
+
+            if current_len >= width {
+                lines.push(Line::from(current));
+                current = Vec::new();
+                current_len = 0;
             }
         }
     }
 
-    Line::from(spans)
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+
+    lines
 }
 
-pub(crate) fn render_side_panels(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    preview: &Text<'static>,
-    git: Option<&Text<'static>>,
-    preview_title: &str,
-    focus: Focus,
-    accent: Color,
-    text: Color,
-    preview_scroll: u16,
-    git_scroll: u16,
-) {
-    let preview_focused = matches!(focus, Focus::Preview | Focus::TagEdit);
-    let git_focused = focus == Focus::Git;
-    let preview_border_style = if preview_focused {
-        Style::default().fg(accent)
+fn tag_color(tag: &str, fallback: Color) -> Color {
+    let mut hash = 2166136261u32;
+    for byte in tag.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let hue = (hash % 360) as f32;
+    hsl_to_rgb(hue, 0.6, 0.55).unwrap_or(fallback)
+}
+
+fn hsl_to_rgb(hue: f32, sat: f32, light: f32) -> Option<Color> {
+    if !(0.0..=360.0).contains(&hue) {
+        return None;
+    }
+    let c = (1.0 - (2.0 * light - 1.0).abs()) * sat;
+    let h = hue / 60.0;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = if (0.0..1.0).contains(&h) {
+        (c, x, 0.0)
+    } else if (1.0..2.0).contains(&h) {
+        (x, c, 0.0)
+    } else if (2.0..3.0).contains(&h) {
+        (0.0, c, x)
+    } else if (3.0..4.0).contains(&h) {
+        (0.0, x, c)
+    } else if (4.0..5.0).contains(&h) {
+        (x, 0.0, c)
     } else {
-        Style::default().fg(text)
+        (c, 0.0, x)
+    };
+    let m = light - c / 2.0;
+    let r = ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let g = ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let b = ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Some(Color::Rgb(r, g, b))
+}
+
+pub(crate) fn render_side_panels(frame: &mut ratatui::Frame, render: SidePanelRender<'_>) {
+    let preview_focused = matches!(render.focus, Focus::Preview | Focus::TagEdit);
+    let git_focused = render.focus == Focus::Git;
+    let preview_border_style = if preview_focused {
+        Style::default().fg(render.accent)
+    } else {
+        Style::default().fg(render.text)
     };
     let git_border_style = if git_focused {
-        Style::default().fg(accent)
+        Style::default().fg(render.accent)
     } else {
-        Style::default().fg(text)
+        Style::default().fg(render.text)
     };
-    let preview_title = build_preview_title_line(preview_title, preview_focused, text);
+    let preview_title =
+        build_preview_title_line(render.preview_title, preview_focused, render.text);
 
-    if let Some(git) = git {
+    if let Some(git) = render.git {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
+            .split(render.area);
 
-        let preview_title = preview_title.clone();
-        let preview_paragraph = Paragraph::new(preview.clone())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(preview_title)
-                    .border_style(preview_border_style)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(text))
-            .alignment(Alignment::Left)
-            .scroll((preview_scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(preview_paragraph, chunks[0]);
+        render_preview_panel(
+            frame,
+            chunks[0],
+            &render,
+            preview_title.clone(),
+            preview_border_style,
+        );
 
         let git_title = if git_focused { "* Git" } else { "Git" };
-        let git_title = Span::styled(git_title, Style::default().fg(text));
+        let git_title = Span::styled(git_title, Style::default().fg(render.text));
         let git_paragraph = Paragraph::new(git.clone())
             .block(
                 Block::default()
@@ -230,34 +645,207 @@ pub(crate) fn render_side_panels(
                     .border_style(git_border_style)
                     .border_type(BorderType::Rounded),
             )
-            .style(Style::default().fg(text))
+            .style(Style::default().fg(render.text))
             .alignment(Alignment::Left)
-            .scroll((git_scroll, 0))
+            .scroll((render.git_scroll, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(git_paragraph, chunks[1]);
     } else {
-        let preview_title = preview_title.clone();
-        let preview_paragraph = Paragraph::new(preview.clone())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(preview_title)
-                    .border_style(preview_border_style)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(text))
-            .alignment(Alignment::Left)
-            .scroll((preview_scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(preview_paragraph, area);
+        render_preview_panel(
+            frame,
+            render.area,
+            &render,
+            preview_title.clone(),
+            preview_border_style,
+        );
     }
 }
 
-fn build_preview_title_line(title: &str, focused: bool, text: Color) -> Line<'static> {
+fn build_preview_title_line(
+    title: &str,
+    focused: bool,
+    text: ratatui::style::Color,
+) -> Line<'static> {
     let label = if focused {
         format!("* {}", title)
     } else {
         title.to_string()
     };
     Line::from(Span::styled(label, Style::default().fg(text)))
+}
+
+fn panel_inner_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn min_tab_window_width(
+    labels: &[String],
+    selected_index: usize,
+    settings: PreviewSettings,
+) -> usize {
+    if labels.is_empty() {
+        return 0;
+    }
+    let label_width = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            tab_min_width(
+                label,
+                if index == selected_index {
+                    settings.selected_worktree_tab_min_chars
+                } else {
+                    settings.worktree_tab_min_chars
+                },
+            )
+        })
+        .sum::<usize>();
+    label_width + labels.len().saturating_sub(1) * TAB_DIVIDER_WIDTH
+}
+
+fn rendered_tab_width(labels: &[String]) -> usize {
+    if labels.is_empty() {
+        return 0;
+    }
+    labels
+        .iter()
+        .map(|label| label.chars().count())
+        .sum::<usize>()
+        + labels.len().saturating_sub(1) * TAB_DIVIDER_WIDTH
+}
+
+fn fit_tab_labels(
+    labels: &[String],
+    selected_index: usize,
+    width: usize,
+    settings: PreviewSettings,
+) -> Vec<String> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+
+    let divider_width = labels.len().saturating_sub(1) * TAB_DIVIDER_WIDTH;
+    let budget = width.saturating_sub(divider_width);
+    let mut widths = labels
+        .iter()
+        .map(|label| label.chars().count())
+        .collect::<Vec<usize>>();
+    let min_widths = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            tab_min_width(
+                label,
+                if index == selected_index {
+                    settings.selected_worktree_tab_min_chars
+                } else {
+                    settings.worktree_tab_min_chars
+                },
+            )
+        })
+        .collect::<Vec<usize>>();
+
+    while widths.iter().sum::<usize>() > budget {
+        let mut changed = false;
+        for index in (0..widths.len()).rev() {
+            if widths[index] > min_widths[index] {
+                widths[index] -= 1;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    while widths.iter().sum::<usize>() > budget {
+        let Some((index, _)) = widths.iter().enumerate().max_by_key(|(_, width)| **width) else {
+            break;
+        };
+        if widths[index] == 0 {
+            break;
+        }
+        widths[index] -= 1;
+    }
+
+    labels
+        .iter()
+        .zip(widths)
+        .map(|(label, width)| truncate_tab_label(label, width))
+        .collect()
+}
+
+fn tab_min_width(label: &str, min_chars_before_ellipsis: usize) -> usize {
+    let len = label.chars().count();
+    if len <= min_chars_before_ellipsis {
+        len
+    } else {
+        min_chars_before_ellipsis.saturating_add(3)
+    }
+}
+
+fn render_preview_panel(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    render: &SidePanelRender<'_>,
+    title: Line<'static>,
+    border_style: Style,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style)
+        .border_type(BorderType::Rounded);
+    let inner = panel_inner_area(area);
+    frame.render_widget(block, area);
+
+    let mut content_area = inner;
+    if render.preview_tab_labels.len() > 1 && inner.height > 0 {
+        let tab_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        content_area = preview_content_area(area, render.preview_tab_labels.len());
+        let (visible_labels, visible_index) = visible_tab_window(
+            render.preview_tab_labels,
+            render.preview_tab_index,
+            tab_area.width as usize,
+            render.preview_settings,
+        );
+        let titles = visible_labels
+            .iter()
+            .map(|label| {
+                Line::from(Span::styled(
+                    label.clone(),
+                    Style::default().fg(render.text),
+                ))
+            })
+            .collect::<Vec<Line<'static>>>();
+        let tabs = Tabs::new(titles)
+            .select(visible_index)
+            .divider(" | ")
+            .padding("", "")
+            .style(Style::default().fg(render.text))
+            .highlight_style(
+                Style::default()
+                    .fg(render.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(tabs, tab_area);
+    }
+
+    let preview_paragraph = Paragraph::new(render.preview.clone())
+        .style(Style::default().fg(render.text))
+        .alignment(Alignment::Left)
+        .scroll((render.preview_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(preview_paragraph, content_area);
 }

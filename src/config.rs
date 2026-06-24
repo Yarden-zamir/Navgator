@@ -1,3 +1,4 @@
+use crate::model::{default_preview_settings, AppResult, LoadedConfig, CONFIG_SCHEMA_URL};
 use figment::providers::{Format, Toml};
 use figment::Figment;
 use schemars::{schema_for, JsonSchema};
@@ -7,16 +8,6 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
 };
-
-use crate::AppResult;
-
-const CONFIG_SCHEMA_URL: &str =
-    "https://raw.githubusercontent.com/Yarden-zamir/Navgator/main/config-schema.json";
-
-pub(crate) struct LoadedConfig {
-    pub(crate) index_folders: Vec<PathBuf>,
-    pub(crate) static_items: Vec<PathBuf>,
-}
 
 #[derive(Default, Deserialize, JsonSchema)]
 #[schemars(
@@ -29,13 +20,16 @@ struct ConfigFile {
         title = "Schema URL",
         description = "Optional JSON Schema URL for editor autocompletion and validation."
     )]
-    schema_url: Option<String>,
+    _schema_url: Option<String>,
     #[serde(default)]
     #[schemars(
         title = "Paths",
         description = "Path collection settings used to build the navigation list."
     )]
     paths: Option<ConfigPaths>,
+    #[serde(default)]
+    #[schemars(title = "Preview", description = "Preview panel settings.")]
+    preview: Option<ConfigPreview>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -58,6 +52,32 @@ struct ConfigPaths {
     static_items: Vec<String>,
 }
 
+#[derive(Default, Deserialize, JsonSchema)]
+#[schemars(
+    title = "Preview Settings",
+    description = "Settings for preview and worktree preview tabs."
+)]
+struct ConfigPreview {
+    #[serde(default)]
+    #[schemars(
+        title = "Shorten Worktree Tab Labels",
+        description = "When true, worktree tab labels use only the segment after the last slash, for example feat/yarden/potato becomes potato. Defaults to true."
+    )]
+    shorten_worktree_tab_labels: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        title = "Worktree Tab Minimum Characters",
+        description = "Minimum label characters to keep before the ellipsis for non-selected worktree preview tabs. Defaults to 6."
+    )]
+    worktree_tab_min_chars: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        title = "Selected Worktree Tab Minimum Characters",
+        description = "Minimum label characters to keep before the ellipsis for the selected worktree preview tab. Defaults to 10."
+    )]
+    selected_worktree_tab_min_chars: Option<usize>,
+}
+
 pub(crate) fn config_schema_json() -> AppResult<String> {
     let schema = schema_for!(ConfigFile);
     serde_json::to_string_pretty(&schema)
@@ -70,6 +90,7 @@ pub(crate) fn load_config() -> AppResult<LoadedConfig> {
     let mut static_items = Vec::new();
     let mut seen_index = HashSet::new();
     let mut seen_static = HashSet::new();
+    let mut preview_settings = default_preview_settings();
     let mut found_config = false;
 
     for path in config_paths(&home) {
@@ -78,9 +99,10 @@ pub(crate) fn load_config() -> AppResult<LoadedConfig> {
         }
         found_config = true;
         let base_dir = path.parent().unwrap_or(&home);
-        let config: ConfigFile = Figment::from(Toml::file(&path))
-            .extract()
-            .map_err(|err| format!("Failed to parse config {}: {}", path.display(), err))?;
+        let config: ConfigFile = Figment::from(Toml::file(&path)).extract().map_err(|err| {
+            let display_path = display_path_for_user(&path.to_string_lossy());
+            format!("Failed to parse config {}: {}", display_path, err)
+        })?;
         ensure_schema_link_in_config_file(&path, &config);
         if let Some(paths) = config.paths {
             merge_paths(
@@ -98,6 +120,17 @@ pub(crate) fn load_config() -> AppResult<LoadedConfig> {
                 &mut seen_static,
             );
         }
+        if let Some(preview) = config.preview {
+            if let Some(value) = preview.shorten_worktree_tab_labels {
+                preview_settings.shorten_worktree_tab_labels = value;
+            }
+            if let Some(value) = preview.worktree_tab_min_chars {
+                preview_settings.worktree_tab_min_chars = value.max(1);
+            }
+            if let Some(value) = preview.selected_worktree_tab_min_chars {
+                preview_settings.selected_worktree_tab_min_chars = value.max(1);
+            }
+        }
     }
 
     if !found_config {
@@ -107,16 +140,17 @@ pub(crate) fn load_config() -> AppResult<LoadedConfig> {
     Ok(LoadedConfig {
         index_folders,
         static_items,
+        preview_settings,
     })
 }
 
-fn home_dir() -> AppResult<PathBuf> {
+pub(crate) fn home_dir() -> AppResult<PathBuf> {
     let value = env::var("HOME").map_err(|_| "HOME is not set")?;
     Ok(PathBuf::from(value))
 }
 
 fn ensure_schema_link_in_config_file(path: &Path, config: &ConfigFile) {
-    if config.schema_url.is_some() || config.paths.is_none() {
+    if config._schema_url.is_some() || config.paths.is_none() {
         return;
     }
 
@@ -206,4 +240,31 @@ fn normalize_path(raw: &str, base_dir: &Path, home: &Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn display_path_for_user(path: &str) -> String {
+    match env::var("HOME") {
+        Ok(home) => display_path_with_home(path, &home),
+        Err(_) => path.to_string(),
+    }
+}
+
+fn display_path_with_home(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+
+    let home_with_separator = format!(
+        "{}{}",
+        home.trim_end_matches(std::path::MAIN_SEPARATOR),
+        std::path::MAIN_SEPARATOR
+    );
+    if let Some(rest) = path.strip_prefix(&home_with_separator) {
+        return format!("~/{}", rest);
+    }
+
+    path.to_string()
 }
