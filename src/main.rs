@@ -28,6 +28,7 @@ mod commands;
 mod config;
 mod content;
 mod git;
+mod github;
 mod metadata;
 mod model;
 mod results;
@@ -37,14 +38,15 @@ mod ui;
 
 use config::config_schema_json;
 use content::{
-    apply_git_result, apply_preview_data, build_placeholder_text, build_preview_data,
-    ensure_git_for_preview,
+    apply_git_result, apply_github_readme_result, apply_preview_data, build_placeholder_text,
+    build_preview_data, ensure_git_for_preview, preview_tab_visible_indexes, ApplyPreviewData,
 };
+use github::ensure_github_readme_for_preview;
 use metadata::{ensure_dates_for_paths, spawn_bulk_metadata_fetch};
 use model::{
-    AppResult, Focus, GitResult, HelpColors, HelpContext, MetaResult, PreviewColors, PreviewData,
-    PreviewResult, PreviewSettings, SidePanelRender, SortMeta, SortMode, TagResult,
-    VisibleListArgs, DATE_PLACEHOLDER,
+    AppResult, DetailTab, Focus, GitResult, GithubReadmeResult, HelpColors, HelpContext,
+    MetaResult, PreviewColors, PreviewData, PreviewResult, PreviewSettings, SidePanelRender,
+    SortMeta, SortMode, TagResult, VisibleListArgs, DATE_PLACEHOLDER,
 };
 use results::build_items;
 use search::{entry_name, filter_and_sort, index_for_path, parse_query_tokens};
@@ -148,10 +150,12 @@ fn select_from_list(
     let muted = text;
     let (preview_tx, preview_rx) = mpsc::channel::<PreviewResult>();
     let (git_tx, git_rx) = mpsc::channel::<GitResult>();
+    let (github_tx, github_rx) = mpsc::channel::<GithubReadmeResult>();
     let (date_tx, date_rx) = mpsc::channel::<MetaResult>();
     let (tag_tx, tag_rx) = mpsc::channel::<TagResult>();
     let mut preview_cache: HashMap<String, PreviewData> = HashMap::new();
     let mut git_in_flight: HashSet<String> = HashSet::new();
+    let mut github_in_flight: HashSet<String> = HashSet::new();
     let mut date_cache: HashMap<String, String> = HashMap::new();
     let mut date_in_flight: HashSet<String> = HashSet::new();
     let mut tag_cache: HashMap<String, Vec<String>> = HashMap::new();
@@ -162,15 +166,18 @@ fn select_from_list(
     let mut in_flight: Option<String> = None;
     let mut preview_text = build_placeholder_text(None, accent, muted, text, "No selection");
     let mut preview_tab_index = 0usize;
+    let mut preview_tab_visible_index = 0usize;
     let mut preview_tab_count = 1usize;
     let mut preview_tab_labels: Vec<String> = Vec::new();
-    let mut git_text: Option<Text<'static>> = None;
+    let mut worktree_filter = Input::default();
+    let mut detail_tabs: Vec<DetailTab> = Vec::new();
+    let mut detail_tab_index = 0usize;
     let mut preview_scroll = 0usize;
-    let mut git_scroll = 0usize;
+    let mut detail_scroll = 0usize;
     let mut preview_max_scroll = 0usize;
-    let mut git_max_scroll = 0usize;
+    let mut detail_max_scroll = 0usize;
     let mut preview_page_step = 5usize;
-    let mut git_page_step = 5usize;
+    let mut detail_page_step = 5usize;
     let start_time = Instant::now();
     let mut tag_edit_path: Option<String> = None;
     let mut tag_edit_tags: Vec<String> = Vec::new();
@@ -197,15 +204,32 @@ fn select_from_list(
                         text,
                     },
                 );
+                ensure_github_readme_for_preview(
+                    &result.path,
+                    data,
+                    &mut github_in_flight,
+                    &github_tx,
+                    preview_tab_index,
+                    PreviewColors {
+                        accent,
+                        muted,
+                        text,
+                    },
+                );
             }
             if current.as_deref() == Some(result.path.as_str()) {
                 apply_preview_data(
                     &result.data,
-                    &mut preview_tab_index,
-                    &mut preview_tab_count,
-                    &mut preview_tab_labels,
-                    &mut preview_text,
-                    &mut git_text,
+                    ApplyPreviewData {
+                        tab_index: &mut preview_tab_index,
+                        tab_visible_index: &mut preview_tab_visible_index,
+                        tab_count: &mut preview_tab_count,
+                        tab_labels: &mut preview_tab_labels,
+                        preview_text: &mut preview_text,
+                        detail_tabs: &mut detail_tabs,
+                        detail_tab_index: &mut detail_tab_index,
+                        worktree_filter: worktree_filter.value(),
+                    },
                 );
                 preview_path = Some(result.path.clone());
             }
@@ -227,11 +251,44 @@ fn select_from_list(
                 if let Some(data) = preview_cache.get(&result.path) {
                     apply_preview_data(
                         data,
-                        &mut preview_tab_index,
-                        &mut preview_tab_count,
-                        &mut preview_tab_labels,
-                        &mut preview_text,
-                        &mut git_text,
+                        ApplyPreviewData {
+                            tab_index: &mut preview_tab_index,
+                            tab_visible_index: &mut preview_tab_visible_index,
+                            tab_count: &mut preview_tab_count,
+                            tab_labels: &mut preview_tab_labels,
+                            preview_text: &mut preview_text,
+                            detail_tabs: &mut detail_tabs,
+                            detail_tab_index: &mut detail_tab_index,
+                            worktree_filter: worktree_filter.value(),
+                        },
+                    );
+                }
+            }
+        }
+
+        while let Ok(result) = github_rx.try_recv() {
+            if result.done {
+                github_in_flight.remove(&result.path);
+            }
+            let mut updated = false;
+            if let Some(data) = preview_cache.get_mut(&result.path) {
+                apply_github_readme_result(data, result.tab_index, result.readme, result.done);
+                updated = true;
+            }
+            if updated && current.as_deref() == Some(result.path.as_str()) {
+                if let Some(data) = preview_cache.get(&result.path) {
+                    apply_preview_data(
+                        data,
+                        ApplyPreviewData {
+                            tab_index: &mut preview_tab_index,
+                            tab_visible_index: &mut preview_tab_visible_index,
+                            tab_count: &mut preview_tab_count,
+                            tab_labels: &mut preview_tab_labels,
+                            preview_text: &mut preview_text,
+                            detail_tabs: &mut detail_tabs,
+                            detail_tab_index: &mut detail_tab_index,
+                            worktree_filter: worktree_filter.value(),
+                        },
                     );
                 }
             }
@@ -292,31 +349,42 @@ fn select_from_list(
                 if preview_path.is_some() || in_flight.is_some() {
                     preview_text =
                         build_placeholder_text(None, accent, muted, text, "No selection");
-                    git_text = None;
+                    detail_tabs.clear();
                     preview_path = None;
                     in_flight = None;
                     preview_tab_index = 0;
+                    preview_tab_visible_index = 0;
+                    detail_tab_index = 0;
                     preview_tab_count = 1;
                     preview_tab_labels.clear();
+                    worktree_filter.reset();
                     preview_scroll = 0;
-                    git_scroll = 0;
+                    detail_scroll = 0;
                 }
             }
             Some(path) => {
                 if preview_path.as_deref() != Some(path) {
                     preview_tab_index = 0;
+                    preview_tab_visible_index = 0;
+                    detail_tab_index = 0;
                     preview_tab_count = 1;
                     preview_tab_labels.clear();
+                    worktree_filter.reset();
                     preview_scroll = 0;
-                    git_scroll = 0;
+                    detail_scroll = 0;
                     if let Some(data) = preview_cache.get(path) {
                         apply_preview_data(
                             data,
-                            &mut preview_tab_index,
-                            &mut preview_tab_count,
-                            &mut preview_tab_labels,
-                            &mut preview_text,
-                            &mut git_text,
+                            ApplyPreviewData {
+                                tab_index: &mut preview_tab_index,
+                                tab_visible_index: &mut preview_tab_visible_index,
+                                tab_count: &mut preview_tab_count,
+                                tab_labels: &mut preview_tab_labels,
+                                preview_text: &mut preview_text,
+                                detail_tabs: &mut detail_tabs,
+                                detail_tab_index: &mut detail_tab_index,
+                                worktree_filter: worktree_filter.value(),
+                            },
                         );
                         preview_path = Some(path.to_string());
                         ensure_git_for_preview(
@@ -324,6 +392,18 @@ fn select_from_list(
                             data,
                             &mut git_in_flight,
                             &git_tx,
+                            preview_tab_index,
+                            PreviewColors {
+                                accent,
+                                muted,
+                                text,
+                            },
+                        );
+                        ensure_github_readme_for_preview(
+                            path,
+                            data,
+                            &mut github_in_flight,
+                            &github_tx,
                             preview_tab_index,
                             PreviewColors {
                                 accent,
@@ -339,7 +419,8 @@ fn select_from_list(
                             text,
                             "Loading preview...",
                         );
-                        git_text = None;
+                        detail_tabs.clear();
+                        detail_tab_index = 0;
                         preview_tab_labels.clear();
                         preview_path = Some(path.to_string());
                         in_flight = Some(path.to_string());
@@ -363,16 +444,16 @@ fn select_from_list(
             }
         }
 
-        if focus == Focus::Git && git_text.is_none() {
+        if focus == Focus::Detail && detail_tabs.is_empty() {
             focus = Focus::Preview;
         }
         if focus == Focus::TagEdit && tag_edit_path.is_none() {
             focus = Focus::Preview;
         }
 
-        let show_git = git_text.is_some();
+        let show_detail = !detail_tabs.is_empty();
         let size = terminal.size()?;
-        let ui = compute_ui_layout(size.into(), show_git);
+        let ui = compute_ui_layout(size.into(), show_detail);
 
         terminal.draw(|frame| {
             let list_area = ui.list_area;
@@ -455,13 +536,17 @@ fn select_from_list(
 
             let preview_body_area = preview_content_area(ui.preview_area, preview_tab_count);
             let preview_height = preview_body_area.height as usize;
-            let git_height = ui
-                .git_area
-                .map(|rect| rect.height.saturating_sub(2) as usize)
+            let detail_height = ui
+                .detail_panel_area
+                .map(|rect| {
+                    let tab_row = if detail_tabs.len() > 1 { 1 } else { 0 };
+                    rect.height.saturating_sub(2).saturating_sub(tab_row) as usize
+                })
                 .unwrap_or(0);
             preview_page_step = preview_height.max(1);
-            git_page_step = git_height.max(1);
-            let preview_title = build_preview_panel_title(current.as_deref());
+            detail_page_step = detail_height.max(1);
+            let preview_title =
+                build_preview_panel_title(current.as_deref(), worktree_filter.value());
             let preview_tags = if focus == Focus::TagEdit {
                 tag_edit_tags.clone()
             } else {
@@ -487,10 +572,10 @@ fn select_from_list(
                 )
             };
             preview_max_scroll = text_line_count(&preview_combined).saturating_sub(preview_height);
-            git_max_scroll = match git_text.as_ref() {
-                Some(git) => text_line_count(git).saturating_sub(git_height),
-                None => 0,
-            };
+            let active_detail = detail_tabs.get(detail_tab_index);
+            detail_max_scroll = active_detail
+                .map(|tab| text_line_count(&tab.text).saturating_sub(detail_height))
+                .unwrap_or(0);
             if focus == Focus::TagEdit {
                 if let Some((row, _)) = tag_cursor {
                     if row < preview_scroll {
@@ -501,22 +586,23 @@ fn select_from_list(
                 }
             }
             preview_scroll = preview_scroll.min(preview_max_scroll);
-            git_scroll = git_scroll.min(git_max_scroll);
+            detail_scroll = detail_scroll.min(detail_max_scroll);
             render_side_panels(
                 frame,
                 SidePanelRender {
                     area: detail_area,
                     preview: &preview_combined,
-                    git: git_text.as_ref(),
+                    detail_tabs: &detail_tabs,
+                    detail_tab_index,
                     preview_title: &preview_title,
                     preview_tab_labels: &preview_tab_labels,
-                    preview_tab_index,
+                    preview_tab_index: preview_tab_visible_index,
                     preview_settings,
                     focus,
                     accent,
                     text,
                     preview_scroll: preview_scroll as u16,
-                    git_scroll: git_scroll as u16,
+                    detail_scroll: detail_scroll as u16,
                 },
             );
             if focus == Focus::TagEdit {
@@ -534,14 +620,16 @@ fn select_from_list(
                 HelpContext {
                     focus,
                     sort_mode,
-                    show_git,
+                    show_detail,
                     cursor_at_end: input_at_end(&input),
                     has_tag_input: !tag_input.value().trim().is_empty(),
-                    preview_tab_index,
+                    preview_tab_index: preview_tab_visible_index,
                     preview_tab_count,
                     preview_scroll,
                     preview_max_scroll,
-                    git_scroll,
+                    detail_tab_index,
+                    detail_tab_count: detail_tabs.len(),
+                    detail_scroll,
                 },
                 HelpColors {
                     text,
@@ -724,20 +812,121 @@ fn select_from_list(
                             }
                         },
                         Focus::Preview => match key.code {
-                            KeyCode::Left => {
-                                if preview_tab_index > 0 {
-                                    preview_tab_index -= 1;
+                            KeyCode::Char('u')
+                                if key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !worktree_filter.value().is_empty() =>
+                            {
+                                worktree_filter.reset();
+                                preview_tab_visible_index = 0;
+                                preview_scroll = 0;
+                                detail_tab_index = 0;
+                                detail_scroll = 0;
+                                if let Some(data) =
+                                    current.as_deref().and_then(|path| preview_cache.get(path))
+                                {
+                                    apply_preview_data(
+                                        data,
+                                        ApplyPreviewData {
+                                            tab_index: &mut preview_tab_index,
+                                            tab_visible_index: &mut preview_tab_visible_index,
+                                            tab_count: &mut preview_tab_count,
+                                            tab_labels: &mut preview_tab_labels,
+                                            preview_text: &mut preview_text,
+                                            detail_tabs: &mut detail_tabs,
+                                            detail_tab_index: &mut detail_tab_index,
+                                            worktree_filter: worktree_filter.value(),
+                                        },
+                                    );
+                                }
+                            }
+                            KeyCode::Char(_)
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                let before = worktree_filter.value().to_string();
+                                let _ = worktree_filter.handle_event(&Event::Key(key));
+                                if worktree_filter.value() != before {
+                                    preview_tab_visible_index = 0;
                                     preview_scroll = 0;
+                                    detail_tab_index = 0;
+                                    detail_scroll = 0;
                                     if let Some(data) =
                                         current.as_deref().and_then(|path| preview_cache.get(path))
                                     {
                                         apply_preview_data(
                                             data,
-                                            &mut preview_tab_index,
-                                            &mut preview_tab_count,
-                                            &mut preview_tab_labels,
-                                            &mut preview_text,
-                                            &mut git_text,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace if !worktree_filter.value().is_empty() => {
+                                let before = worktree_filter.value().to_string();
+                                let _ = worktree_filter.handle_event(&Event::Key(key));
+                                if worktree_filter.value() != before {
+                                    preview_tab_visible_index = 0;
+                                    preview_scroll = 0;
+                                    detail_tab_index = 0;
+                                    detail_scroll = 0;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        apply_preview_data(
+                                            data,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Left => {
+                                if preview_tab_visible_index > 0 {
+                                    preview_tab_visible_index -= 1;
+                                    preview_scroll = 0;
+                                    detail_tab_index = 0;
+                                    detail_scroll = 0;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        let visible_indexes = preview_tab_visible_indexes(
+                                            data,
+                                            worktree_filter.value(),
+                                        );
+                                        if let Some(index) =
+                                            visible_indexes.get(preview_tab_visible_index)
+                                        {
+                                            preview_tab_index = *index;
+                                        }
+                                        apply_preview_data(
+                                            data,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
                                         );
                                     }
                                 } else {
@@ -745,40 +934,72 @@ fn select_from_list(
                                 }
                             }
                             KeyCode::Right => {
-                                if preview_tab_index + 1 < preview_tab_count {
-                                    preview_tab_index += 1;
+                                if preview_tab_visible_index + 1 < preview_tab_count {
+                                    preview_tab_visible_index += 1;
                                     preview_scroll = 0;
+                                    detail_tab_index = 0;
+                                    detail_scroll = 0;
                                     if let Some(data) =
                                         current.as_deref().and_then(|path| preview_cache.get(path))
                                     {
+                                        let visible_indexes = preview_tab_visible_indexes(
+                                            data,
+                                            worktree_filter.value(),
+                                        );
+                                        if let Some(index) =
+                                            visible_indexes.get(preview_tab_visible_index)
+                                        {
+                                            preview_tab_index = *index;
+                                        }
                                         apply_preview_data(
                                             data,
-                                            &mut preview_tab_index,
-                                            &mut preview_tab_count,
-                                            &mut preview_tab_labels,
-                                            &mut preview_text,
-                                            &mut git_text,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
                                         );
                                     }
-                                } else if git_text.is_some() {
-                                    focus = Focus::Git;
+                                } else if !detail_tabs.is_empty() {
+                                    focus = Focus::Detail;
                                 }
                             }
                             KeyCode::Up => {
                                 if preview_scroll > 0 {
                                     preview_scroll -= 1;
-                                } else if preview_tab_index > 0 {
-                                    preview_tab_index -= 1;
+                                } else if preview_tab_visible_index > 0 {
+                                    preview_tab_visible_index -= 1;
+                                    detail_tab_index = 0;
+                                    detail_scroll = 0;
                                     if let Some(data) =
                                         current.as_deref().and_then(|path| preview_cache.get(path))
                                     {
+                                        let visible_indexes = preview_tab_visible_indexes(
+                                            data,
+                                            worktree_filter.value(),
+                                        );
+                                        if let Some(index) =
+                                            visible_indexes.get(preview_tab_visible_index)
+                                        {
+                                            preview_tab_index = *index;
+                                        }
                                         apply_preview_data(
                                             data,
-                                            &mut preview_tab_index,
-                                            &mut preview_tab_count,
-                                            &mut preview_tab_labels,
-                                            &mut preview_text,
-                                            &mut git_text,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
                                         );
                                     }
                                 } else if preview_scroll == 0 {
@@ -788,24 +1009,41 @@ fn select_from_list(
                             KeyCode::Down => {
                                 if preview_scroll < preview_max_scroll {
                                     preview_scroll += 1;
-                                } else if preview_tab_index + 1 < preview_tab_count {
-                                    preview_tab_index += 1;
+                                } else if preview_tab_visible_index + 1 < preview_tab_count {
+                                    preview_tab_visible_index += 1;
                                     preview_scroll = 0;
+                                    detail_tab_index = 0;
+                                    detail_scroll = 0;
                                     if let Some(data) =
                                         current.as_deref().and_then(|path| preview_cache.get(path))
                                     {
+                                        let visible_indexes = preview_tab_visible_indexes(
+                                            data,
+                                            worktree_filter.value(),
+                                        );
+                                        if let Some(index) =
+                                            visible_indexes.get(preview_tab_visible_index)
+                                        {
+                                            preview_tab_index = *index;
+                                        }
                                         apply_preview_data(
                                             data,
-                                            &mut preview_tab_index,
-                                            &mut preview_tab_count,
-                                            &mut preview_tab_labels,
-                                            &mut preview_text,
-                                            &mut git_text,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
                                         );
                                     }
-                                } else if preview_scroll >= preview_max_scroll && git_text.is_some()
+                                } else if preview_scroll >= preview_max_scroll
+                                    && !detail_tabs.is_empty()
                                 {
-                                    focus = Focus::Git;
+                                    focus = Focus::Detail;
                                 }
                             }
                             KeyCode::PageUp => {
@@ -823,48 +1061,73 @@ fn select_from_list(
                             }
                             _ => {}
                         },
-                        Focus::Git => match key.code {
+                        Focus::Detail => match key.code {
                             KeyCode::Left => {
-                                preview_tab_index = preview_tab_count.saturating_sub(1);
-                                preview_scroll = 0;
-                                if let Some(data) =
-                                    current.as_deref().and_then(|path| preview_cache.get(path))
-                                {
-                                    apply_preview_data(
-                                        data,
-                                        &mut preview_tab_index,
-                                        &mut preview_tab_count,
-                                        &mut preview_tab_labels,
-                                        &mut preview_text,
-                                        &mut git_text,
-                                    );
-                                }
-                                focus = Focus::Preview;
-                            }
-                            KeyCode::Right => {
-                                focus = Focus::Preview;
-                            }
-                            KeyCode::Up => {
-                                if git_scroll > 0 {
-                                    git_scroll -= 1;
-                                } else if git_scroll == 0 {
+                                if detail_tab_index > 0 {
+                                    detail_tab_index -= 1;
+                                    detail_scroll = 0;
+                                } else {
+                                    preview_tab_visible_index = preview_tab_count.saturating_sub(1);
+                                    preview_scroll = 0;
+                                    if let Some(data) =
+                                        current.as_deref().and_then(|path| preview_cache.get(path))
+                                    {
+                                        let visible_indexes = preview_tab_visible_indexes(
+                                            data,
+                                            worktree_filter.value(),
+                                        );
+                                        if let Some(index) =
+                                            visible_indexes.get(preview_tab_visible_index)
+                                        {
+                                            preview_tab_index = *index;
+                                        }
+                                        apply_preview_data(
+                                            data,
+                                            ApplyPreviewData {
+                                                tab_index: &mut preview_tab_index,
+                                                tab_visible_index: &mut preview_tab_visible_index,
+                                                tab_count: &mut preview_tab_count,
+                                                tab_labels: &mut preview_tab_labels,
+                                                preview_text: &mut preview_text,
+                                                detail_tabs: &mut detail_tabs,
+                                                detail_tab_index: &mut detail_tab_index,
+                                                worktree_filter: worktree_filter.value(),
+                                            },
+                                        );
+                                    }
                                     focus = Focus::Preview;
                                 }
                             }
-                            KeyCode::Down if git_scroll < git_max_scroll => {
-                                git_scroll += 1;
+                            KeyCode::Right => {
+                                if detail_tab_index + 1 < detail_tabs.len() {
+                                    detail_tab_index += 1;
+                                    detail_scroll = 0;
+                                } else {
+                                    focus = Focus::Preview;
+                                }
+                            }
+                            KeyCode::Up => {
+                                if detail_scroll > 0 {
+                                    detail_scroll -= 1;
+                                } else if detail_scroll == 0 {
+                                    focus = Focus::Preview;
+                                }
+                            }
+                            KeyCode::Down if detail_scroll < detail_max_scroll => {
+                                detail_scroll += 1;
                             }
                             KeyCode::PageUp => {
-                                git_scroll = git_scroll.saturating_sub(git_page_step);
+                                detail_scroll = detail_scroll.saturating_sub(detail_page_step);
                             }
                             KeyCode::PageDown => {
-                                git_scroll = (git_scroll + git_page_step).min(git_max_scroll);
+                                detail_scroll =
+                                    (detail_scroll + detail_page_step).min(detail_max_scroll);
                             }
                             KeyCode::Home => {
-                                git_scroll = 0;
+                                detail_scroll = 0;
                             }
                             KeyCode::End => {
-                                git_scroll = git_max_scroll;
+                                detail_scroll = detail_max_scroll;
                             }
                             _ => {}
                         },
@@ -877,9 +1140,9 @@ fn select_from_list(
                         MouseEventKind::Down(MouseButton::Left) => {
                             if rect_contains(ui.list_area, col, row) {
                                 focus = Focus::Search;
-                            } else if let Some(git_area) = ui.git_area {
-                                if rect_contains(git_area, col, row) {
-                                    focus = Focus::Git;
+                            } else if let Some(detail_panel_area) = ui.detail_panel_area {
+                                if rect_contains(detail_panel_area, col, row) {
+                                    focus = Focus::Detail;
                                 } else if rect_contains(ui.preview_area, col, row) {
                                     focus = Focus::Preview;
                                 }
@@ -890,9 +1153,9 @@ fn select_from_list(
                         MouseEventKind::ScrollUp => {
                             if rect_contains(ui.preview_area, col, row) {
                                 preview_scroll = preview_scroll.saturating_sub(1);
-                            } else if let Some(git_area) = ui.git_area {
-                                if rect_contains(git_area, col, row) {
-                                    git_scroll = git_scroll.saturating_sub(1);
+                            } else if let Some(detail_panel_area) = ui.detail_panel_area {
+                                if rect_contains(detail_panel_area, col, row) {
+                                    detail_scroll = detail_scroll.saturating_sub(1);
                                 }
                             } else if rect_contains(ui.results_area, col, row) {
                                 selected = selected.saturating_sub(1);
@@ -901,9 +1164,9 @@ fn select_from_list(
                         MouseEventKind::ScrollDown => {
                             if rect_contains(ui.preview_area, col, row) {
                                 preview_scroll = (preview_scroll + 1).min(preview_max_scroll);
-                            } else if let Some(git_area) = ui.git_area {
-                                if rect_contains(git_area, col, row) {
-                                    git_scroll = (git_scroll + 1).min(git_max_scroll);
+                            } else if let Some(detail_panel_area) = ui.detail_panel_area {
+                                if rect_contains(detail_panel_area, col, row) {
+                                    detail_scroll = (detail_scroll + 1).min(detail_max_scroll);
                                 }
                             } else if rect_contains(ui.results_area, col, row) {
                                 selected = selected
@@ -968,7 +1231,7 @@ fn enter_selection_path(
     preview_tab_index: usize,
     preview_cache: &HashMap<String, PreviewData>,
 ) -> Option<String> {
-    if !matches!(focus, Focus::Preview | Focus::Git) {
+    if !matches!(focus, Focus::Preview | Focus::Detail) {
         return None;
     }
     let current_path = current_path?;
@@ -978,9 +1241,16 @@ fn enter_selection_path(
         .map(|tab| tab.path.clone())
 }
 
-fn build_preview_panel_title(path: Option<&str>) -> String {
-    path.map(entry_name)
-        .unwrap_or_else(|| "Preview".to_string())
+fn build_preview_panel_title(path: Option<&str>, worktree_filter: &str) -> String {
+    let title = path
+        .map(entry_name)
+        .unwrap_or_else(|| "Preview".to_string());
+    let filter = worktree_filter.trim();
+    if filter.is_empty() {
+        title
+    } else {
+        format!("{} / {}", title, filter)
+    }
 }
 
 fn visible_paths_for_window(
@@ -1127,16 +1397,19 @@ mod tests {
                         label: "main".to_string(),
                         text: Text::default(),
                         git: None,
+                        github_readme: None,
                     },
                     model::PreviewTab {
                         path: "/repos/project-feature".to_string(),
                         label: "feature".to_string(),
                         text: Text::default(),
                         git: None,
+                        github_readme: None,
                     },
                 ],
                 selected_repo_is_bare: false,
                 git_loaded: false,
+                github_readme_loaded: false,
             },
         );
 
@@ -1157,16 +1430,19 @@ mod tests {
                     label: "main".to_string(),
                     text: Text::default(),
                     git: None,
+                    github_readme: None,
                 },
                 model::PreviewTab {
                     path: "/repos/project-feature".to_string(),
                     label: "feature".to_string(),
                     text: Text::default(),
                     git: None,
+                    github_readme: None,
                 },
             ],
             selected_repo_is_bare: true,
             git_loaded: false,
+            github_readme_loaded: false,
         };
 
         apply_git_result(
@@ -1179,6 +1455,84 @@ mod tests {
         assert!(data.previews[0].git.is_none());
         assert!(data.previews[1].git.is_some());
         assert!(!data.git_loaded);
+    }
+
+    #[test]
+    fn orders_github_detail_before_git_detail() {
+        let tab = model::PreviewTab {
+            path: "/repos/project".to_string(),
+            label: "main".to_string(),
+            text: Text::default(),
+            git: Some(Text::from(Line::from("Branch: main"))),
+            github_readme: Some(Text::from(Line::from("# Project"))),
+        };
+
+        let detail_tabs = content::detail_tabs_for_preview(&tab);
+
+        assert_eq!(detail_tabs.len(), 2);
+        assert_eq!(detail_tabs[0].label, "GitHub");
+        assert_eq!(detail_tabs[1].label, "Git");
+    }
+
+    #[test]
+    fn filters_preview_worktree_tabs_by_label_or_path() {
+        let data = PreviewData {
+            previews: vec![
+                model::PreviewTab {
+                    path: "/repos/project".to_string(),
+                    label: "main".to_string(),
+                    text: Text::default(),
+                    git: None,
+                    github_readme: None,
+                },
+                model::PreviewTab {
+                    path: "/repos/project-feature".to_string(),
+                    label: "feature".to_string(),
+                    text: Text::default(),
+                    git: None,
+                    github_readme: None,
+                },
+                model::PreviewTab {
+                    path: "/repos/project-hotfix".to_string(),
+                    label: "hotfix".to_string(),
+                    text: Text::default(),
+                    git: None,
+                    github_readme: None,
+                },
+            ],
+            selected_repo_is_bare: false,
+            git_loaded: false,
+            github_readme_loaded: false,
+        };
+
+        assert_eq!(content::preview_tab_visible_indexes(&data, "feat"), vec![1]);
+        assert_eq!(content::preview_tab_visible_indexes(&data, "hot"), vec![2]);
+        assert_eq!(
+            content::preview_tab_visible_indexes(&data, "missing"),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn sorts_default_branch_worktree_first() {
+        let trunk = model::GitWorktree {
+            path: "/repos/project-trunk".to_string(),
+            branch: Some("trunk".to_string()),
+            detached: false,
+            bare: false,
+        };
+        let feature = model::GitWorktree {
+            path: "/repos/project-feature".to_string(),
+            branch: Some("feature".to_string()),
+            detached: false,
+            bare: false,
+        };
+        let mut worktrees = vec![&feature, &trunk];
+
+        content::sort_worktrees_default_first(&mut worktrees, Some("trunk"));
+
+        assert_eq!(worktrees[0].branch.as_deref(), Some("trunk"));
+        assert_eq!(worktrees[1].branch.as_deref(), Some("feature"));
     }
 
     #[test]

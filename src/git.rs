@@ -45,6 +45,19 @@ pub(crate) fn git_worktrees_for_path(path: &Path) -> Vec<GitWorktree> {
     parse_git_worktree_list(&output)
 }
 
+pub(crate) fn git_default_branch_for_path(path: &Path) -> Option<String> {
+    let repo_dir = git_command_dir_for_path(path)?;
+    let output = run_git_command_allow_empty(
+        &repo_dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )?;
+    output
+        .trim()
+        .strip_prefix("origin/")
+        .filter(|branch| !branch.trim().is_empty())
+        .map(ToString::to_string)
+}
+
 pub(crate) fn parse_git_worktree_list(output: &str) -> Vec<GitWorktree> {
     let mut worktrees = Vec::new();
     let mut current: Option<GitWorktree> = None;

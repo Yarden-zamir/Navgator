@@ -1,11 +1,12 @@
 use crate::commands::{run_command_output, run_git_command_allow_empty};
 use crate::config::home_dir;
 use crate::git::{
-    git_command_dir_for_path, git_is_bare_repository, git_is_inside_work_tree, git_worktree_label,
-    git_worktrees_for_path,
+    git_command_dir_for_path, git_default_branch_for_path, git_is_bare_repository,
+    git_is_inside_work_tree, git_worktree_label, git_worktrees_for_path,
 };
 use crate::model::{
-    GitResult, GitWorktree, PreviewColors, PreviewData, PreviewSettings, PreviewTab, PreviewTarget,
+    DetailTab, GitResult, GitWorktree, PreviewColors, PreviewData, PreviewSettings, PreviewTab,
+    PreviewTarget,
 };
 use crate::search::entry_name;
 use ansi_to_tui::IntoText;
@@ -65,24 +66,90 @@ pub(crate) fn build_placeholder_text(
     Text::from(lines)
 }
 
-pub(crate) fn apply_preview_data(
-    data: &PreviewData,
-    tab_index: &mut usize,
-    tab_count: &mut usize,
-    tab_labels: &mut Vec<String>,
-    preview_text: &mut Text<'static>,
-    git_text: &mut Option<Text<'static>>,
-) {
+pub(crate) struct ApplyPreviewData<'a> {
+    pub(crate) tab_index: &'a mut usize,
+    pub(crate) tab_visible_index: &'a mut usize,
+    pub(crate) tab_count: &'a mut usize,
+    pub(crate) tab_labels: &'a mut Vec<String>,
+    pub(crate) preview_text: &'a mut Text<'static>,
+    pub(crate) detail_tabs: &'a mut Vec<DetailTab>,
+    pub(crate) detail_tab_index: &'a mut usize,
+    pub(crate) worktree_filter: &'a str,
+}
+
+pub(crate) fn apply_preview_data(data: &PreviewData, view: ApplyPreviewData<'_>) {
     if data.previews.is_empty() {
         return;
     }
 
-    *tab_count = data.previews.len();
-    *tab_labels = data.previews.iter().map(|tab| tab.label.clone()).collect();
-    *tab_index = (*tab_index).min(data.previews.len().saturating_sub(1));
-    let tab = &data.previews[*tab_index];
-    *preview_text = tab.text.clone();
-    *git_text = tab.git.clone();
+    let visible_indexes = preview_tab_visible_indexes(data, view.worktree_filter);
+    *view.tab_count = visible_indexes.len();
+    *view.tab_labels = visible_indexes
+        .iter()
+        .filter_map(|index| data.previews.get(*index))
+        .map(|tab| tab.label.clone())
+        .collect();
+    if let Some(visible_index) = visible_indexes
+        .iter()
+        .position(|index| *index == *view.tab_index)
+    {
+        *view.tab_visible_index = visible_index;
+    } else if let Some(first_index) = visible_indexes.first() {
+        *view.tab_index = *first_index;
+        *view.tab_visible_index = 0;
+    } else {
+        *view.tab_index = (*view.tab_index).min(data.previews.len().saturating_sub(1));
+        *view.tab_visible_index = 0;
+    }
+    let tab = &data.previews[*view.tab_index];
+    *view.preview_text = tab.text.clone();
+    *view.detail_tabs = detail_tabs_for_preview(tab);
+    *view.detail_tab_index = (*view.detail_tab_index).min(view.detail_tabs.len().saturating_sub(1));
+}
+
+pub(crate) fn preview_tab_visible_indexes(data: &PreviewData, worktree_filter: &str) -> Vec<usize> {
+    let filter = worktree_filter.trim().to_lowercase();
+    if filter.is_empty() {
+        return (0..data.previews.len()).collect();
+    }
+
+    let matches = data
+        .previews
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            let label = tab.label.to_lowercase();
+            let path = tab.path.to_lowercase();
+            if label.contains(&filter) || path.contains(&filter) {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<usize>>();
+
+    if matches.is_empty() {
+        (0..data.previews.len()).collect()
+    } else {
+        matches
+    }
+}
+
+pub(crate) fn detail_tabs_for_preview(tab: &PreviewTab) -> Vec<DetailTab> {
+    let mut tabs = Vec::new();
+    if let Some(readme) = tab.github_readme.as_ref() {
+        tabs.push(DetailTab {
+            label: "GitHub".to_string(),
+            text: readme.clone(),
+        });
+    }
+    if let Some(git) = tab.git.as_ref() {
+        tabs.push(DetailTab {
+            label: "Git".to_string(),
+            text: git.clone(),
+        });
+    }
+    tabs
 }
 
 pub(crate) fn apply_git_result(
@@ -96,6 +163,20 @@ pub(crate) fn apply_git_result(
     }
     if done {
         data.git_loaded = true;
+    }
+}
+
+pub(crate) fn apply_github_readme_result(
+    data: &mut PreviewData,
+    tab_index: usize,
+    readme: Option<Text<'static>>,
+    done: bool,
+) {
+    if let Some(tab) = data.previews.get_mut(tab_index) {
+        tab.github_readme = readme;
+    }
+    if done {
+        data.github_readme_loaded = true;
     }
 }
 
@@ -163,12 +244,14 @@ pub(crate) fn build_preview_data(
             label: target.label,
             text: build_preview_text(&target.path, accent, muted, text),
             git: None,
+            github_readme: None,
         })
         .collect();
     PreviewData {
         previews,
         selected_repo_is_bare,
         git_loaded: false,
+        github_readme_loaded: false,
     }
 }
 
@@ -183,7 +266,10 @@ fn preview_targets_for_path(path: &str, shorten_worktree_tab_labels: bool) -> Ve
         return vec![fallback];
     }
 
-    let non_bare: Vec<&GitWorktree> = worktrees.iter().filter(|worktree| !worktree.bare).collect();
+    let mut non_bare: Vec<&GitWorktree> =
+        worktrees.iter().filter(|worktree| !worktree.bare).collect();
+    let default_branch = git_default_branch_for_path(path_buf);
+    sort_worktrees_default_first(&mut non_bare, default_branch.as_deref());
     let selected_is_bare = git_command_dir_for_path(path_buf)
         .map(|dir| git_is_bare_repository(&dir))
         .unwrap_or(false);
@@ -195,6 +281,22 @@ fn preview_targets_for_path(path: &str, shorten_worktree_tab_labels: bool) -> Ve
     }
 
     vec![fallback]
+}
+
+pub(crate) fn sort_worktrees_default_first(
+    worktrees: &mut Vec<&GitWorktree>,
+    default_branch: Option<&str>,
+) {
+    let Some(default_branch) = default_branch else {
+        return;
+    };
+    worktrees.sort_by_key(|worktree| {
+        if worktree.branch.as_deref() == Some(default_branch) {
+            0
+        } else {
+            1
+        }
+    });
 }
 
 fn preview_targets_from_worktrees(

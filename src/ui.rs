@@ -23,6 +23,8 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
     let mut spans: Vec<Span> = Vec::new();
     let has_prev_preview = context.preview_tab_index > 0;
     let has_next_preview = context.preview_tab_index + 1 < context.preview_tab_count;
+    let has_prev_detail = context.detail_tab_index > 0;
+    let has_next_detail = context.detail_tab_index + 1 < context.detail_tab_count;
 
     match context.focus {
         Focus::Search => {
@@ -63,9 +65,9 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             if has_next_preview {
                 spans.push(Span::styled("Right", key_style));
                 spans.push(Span::styled(" next  ", regular_style));
-            } else if context.show_git {
+            } else if context.show_detail {
                 spans.push(Span::styled("Right", key_style));
-                spans.push(Span::styled(" git  ", regular_style));
+                spans.push(Span::styled(" detail  ", regular_style));
             }
             spans.push(Span::styled("Ctrl+T", key_style));
             spans.push(Span::styled(" tag  ", regular_style));
@@ -76,21 +78,38 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             if has_next_preview && context.preview_scroll >= context.preview_max_scroll {
                 spans.push(Span::styled("Down", key_style));
                 spans.push(Span::styled(" next", regular_style));
-            } else if context.show_git && context.preview_scroll >= context.preview_max_scroll {
+            } else if context.show_detail && context.preview_scroll >= context.preview_max_scroll {
                 spans.push(Span::styled("Down", key_style));
-                spans.push(Span::styled(" git", regular_style));
+                spans.push(Span::styled(" detail", regular_style));
             }
         }
-        Focus::Git => {
-            spans.push(Span::styled("Git", label_style));
+        Focus::Detail => {
+            let label = if context.detail_tab_count > 1 {
+                format!(
+                    "Detail {}/{}",
+                    context.detail_tab_index + 1,
+                    context.detail_tab_count
+                )
+            } else {
+                "Detail".to_string()
+            };
+            spans.push(Span::styled(label, label_style));
             spans.push(Span::styled("  ", regular_style));
             spans.push(Span::styled("Left", key_style));
-            spans.push(Span::styled(" preview  ", regular_style));
+            if has_prev_detail {
+                spans.push(Span::styled(" prev  ", regular_style));
+            } else {
+                spans.push(Span::styled(" preview  ", regular_style));
+            }
             spans.push(Span::styled("Right", key_style));
-            spans.push(Span::styled(" preview  ", regular_style));
+            if has_next_detail {
+                spans.push(Span::styled(" next  ", regular_style));
+            } else {
+                spans.push(Span::styled(" preview  ", regular_style));
+            }
             spans.push(Span::styled("Ctrl+T", key_style));
             spans.push(Span::styled(" tag  ", regular_style));
-            if context.git_scroll == 0 {
+            if context.detail_scroll == 0 {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" preview", regular_style));
             }
@@ -112,7 +131,7 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
     Line::from(spans)
 }
 
-pub(crate) fn compute_ui_layout(size: Rect, show_git: bool) -> UiLayout {
+pub(crate) fn compute_ui_layout(size: Rect, show_detail: bool) -> UiLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(3)])
@@ -135,7 +154,7 @@ pub(crate) fn compute_ui_layout(size: Rect, show_git: bool) -> UiLayout {
     let search_area = left_chunks[0];
     let results_area = left_chunks[1];
 
-    let (preview_area, git_area) = if show_git {
+    let (preview_area, detail_panel_area) = if show_detail {
         let panels = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -151,7 +170,7 @@ pub(crate) fn compute_ui_layout(size: Rect, show_git: bool) -> UiLayout {
         search_area,
         results_area,
         preview_area,
-        git_area,
+        detail_panel_area,
         help_area: chunks[1],
     }
 }
@@ -607,13 +626,13 @@ fn hsl_to_rgb(hue: f32, sat: f32, light: f32) -> Option<Color> {
 
 pub(crate) fn render_side_panels(frame: &mut ratatui::Frame, render: SidePanelRender<'_>) {
     let preview_focused = matches!(render.focus, Focus::Preview | Focus::TagEdit);
-    let git_focused = render.focus == Focus::Git;
+    let detail_focused = render.focus == Focus::Detail;
     let preview_border_style = if preview_focused {
         Style::default().fg(render.accent)
     } else {
         Style::default().fg(render.text)
     };
-    let git_border_style = if git_focused {
+    let detail_border_style = if detail_focused {
         Style::default().fg(render.accent)
     } else {
         Style::default().fg(render.text)
@@ -621,7 +640,7 @@ pub(crate) fn render_side_panels(frame: &mut ratatui::Frame, render: SidePanelRe
     let preview_title =
         build_preview_title_line(render.preview_title, preview_focused, render.text);
 
-    if let Some(git) = render.git {
+    if !render.detail_tabs.is_empty() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -635,21 +654,7 @@ pub(crate) fn render_side_panels(frame: &mut ratatui::Frame, render: SidePanelRe
             preview_border_style,
         );
 
-        let git_title = if git_focused { "* Git" } else { "Git" };
-        let git_title = Span::styled(git_title, Style::default().fg(render.text));
-        let git_paragraph = Paragraph::new(git.clone())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(git_title)
-                    .border_style(git_border_style)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(render.text))
-            .alignment(Alignment::Left)
-            .scroll((render.git_scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(git_paragraph, chunks[1]);
+        render_detail_panel(frame, chunks[1], &render, detail_border_style);
     } else {
         render_preview_panel(
             frame,
@@ -659,6 +664,70 @@ pub(crate) fn render_side_panels(frame: &mut ratatui::Frame, render: SidePanelRe
             preview_border_style,
         );
     }
+}
+
+fn render_detail_panel(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    render: &SidePanelRender<'_>,
+    border_style: Style,
+) {
+    let focused = render.focus == Focus::Detail;
+    let title = if focused { "* Details" } else { "Details" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(render.text)))
+        .border_style(border_style)
+        .border_type(BorderType::Rounded);
+    let inner = panel_inner_area(area);
+    frame.render_widget(block, area);
+
+    let mut content_area = inner;
+    if render.detail_tabs.len() > 1 && inner.height > 0 {
+        let tab_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        content_area.y = content_area.y.saturating_add(1);
+        content_area.height = content_area.height.saturating_sub(1);
+        let titles = render
+            .detail_tabs
+            .iter()
+            .map(|tab| {
+                Line::from(Span::styled(
+                    tab.label.clone(),
+                    Style::default().fg(render.text),
+                ))
+            })
+            .collect::<Vec<Line<'static>>>();
+        let tabs = Tabs::new(titles)
+            .select(
+                render
+                    .detail_tab_index
+                    .min(render.detail_tabs.len().saturating_sub(1)),
+            )
+            .divider(" | ")
+            .padding("", "")
+            .style(Style::default().fg(render.text))
+            .highlight_style(
+                Style::default()
+                    .fg(render.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(tabs, tab_area);
+    }
+
+    let tab_index = render
+        .detail_tab_index
+        .min(render.detail_tabs.len().saturating_sub(1));
+    let detail_paragraph = Paragraph::new(render.detail_tabs[tab_index].text.clone())
+        .style(Style::default().fg(render.text))
+        .alignment(Alignment::Left)
+        .scroll((render.detail_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail_paragraph, content_area);
 }
 
 fn build_preview_title_line(

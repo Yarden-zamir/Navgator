@@ -93,6 +93,7 @@ pub(crate) struct PreviewTab {
     pub(crate) label: String,
     pub(crate) text: Text<'static>,
     pub(crate) git: Option<Text<'static>>,
+    pub(crate) github_readme: Option<Text<'static>>,
 }
 
 #[derive(Clone)]
@@ -100,6 +101,7 @@ pub(crate) struct PreviewData {
     pub(crate) previews: Vec<PreviewTab>,
     pub(crate) selected_repo_is_bare: bool,
     pub(crate) git_loaded: bool,
+    pub(crate) github_readme_loaded: bool,
 }
 
 pub(crate) struct PreviewTarget {
@@ -166,6 +168,19 @@ pub(crate) struct GitResult {
     pub(crate) done: bool,
 }
 
+pub(crate) struct GithubReadmeResult {
+    pub(crate) path: String,
+    pub(crate) tab_index: usize,
+    pub(crate) readme: Option<Text<'static>>,
+    pub(crate) done: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct DetailTab {
+    pub(crate) label: String,
+    pub(crate) text: Text<'static>,
+}
+
 pub(crate) struct BuildItemsResult {
     pub(crate) items: Vec<String>,
     pub(crate) preview_settings: PreviewSettings,
@@ -228,7 +243,7 @@ impl SortMode {
 pub(crate) enum Focus {
     Search,
     Preview,
-    Git,
+    Detail,
     TagEdit,
 }
 
@@ -236,14 +251,16 @@ pub(crate) enum Focus {
 pub(crate) struct HelpContext {
     pub(crate) focus: Focus,
     pub(crate) sort_mode: SortMode,
-    pub(crate) show_git: bool,
+    pub(crate) show_detail: bool,
     pub(crate) cursor_at_end: bool,
     pub(crate) has_tag_input: bool,
     pub(crate) preview_tab_index: usize,
     pub(crate) preview_tab_count: usize,
     pub(crate) preview_scroll: usize,
     pub(crate) preview_max_scroll: usize,
-    pub(crate) git_scroll: usize,
+    pub(crate) detail_tab_index: usize,
+    pub(crate) detail_tab_count: usize,
+    pub(crate) detail_scroll: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -271,7 +288,8 @@ pub(crate) struct VisibleListArgs<'a> {
 pub(crate) struct SidePanelRender<'a> {
     pub(crate) area: Rect,
     pub(crate) preview: &'a Text<'static>,
-    pub(crate) git: Option<&'a Text<'static>>,
+    pub(crate) detail_tabs: &'a [DetailTab],
+    pub(crate) detail_tab_index: usize,
     pub(crate) preview_title: &'a str,
     pub(crate) preview_tab_labels: &'a [String],
     pub(crate) preview_tab_index: usize,
@@ -280,7 +298,7 @@ pub(crate) struct SidePanelRender<'a> {
     pub(crate) accent: Color,
     pub(crate) text: Color,
     pub(crate) preview_scroll: u16,
-    pub(crate) git_scroll: u16,
+    pub(crate) detail_scroll: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +308,6 @@ pub(crate) struct UiLayout {
     pub(crate) search_area: Rect,
     pub(crate) results_area: Rect,
     pub(crate) preview_area: Rect,
-    pub(crate) git_area: Option<Rect>,
+    pub(crate) detail_panel_area: Option<Rect>,
     pub(crate) help_area: Rect,
 }
