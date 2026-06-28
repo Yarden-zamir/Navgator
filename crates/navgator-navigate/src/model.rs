@@ -277,6 +277,7 @@ pub(crate) struct VisibleListArgs<'a> {
     pub(crate) offset: usize,
     pub(crate) height: usize,
     pub(crate) text: Color,
+    pub(crate) accent: Color,
     pub(crate) muted: Color,
     pub(crate) dates: &'a std::collections::HashMap<String, String>,
     pub(crate) tags: &'a std::collections::HashMap<String, Vec<String>>,

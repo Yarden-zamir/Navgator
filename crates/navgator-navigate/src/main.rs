@@ -1,7 +1,7 @@
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -16,7 +16,7 @@ use ratatui::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    env, fs, io,
+    env, io,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -25,6 +25,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::{Input, InputRequest};
 
 mod commands;
+mod compositor;
 mod config;
 mod content;
 mod git;
@@ -36,20 +37,22 @@ mod search;
 mod tags;
 mod ui;
 
+use compositor::{CurrentCompositor, FocusChange, NavigationCompositor};
 use config::config_schema_json;
 use content::{
-    apply_git_result, apply_github_readme_result, apply_preview_data, build_placeholder_text,
-    build_preview_data, ensure_git_for_preview, preview_tab_visible_indexes, ApplyPreviewData,
+    apply_git_result, apply_github_readme_result, build_placeholder_text, build_preview_data,
+    ensure_git_for_preview,
 };
 use github::ensure_github_readme_for_preview;
 use metadata::{ensure_dates_for_paths, spawn_bulk_metadata_fetch};
 use model::{
-    AppResult, DetailTab, Focus, GitResult, GithubReadmeResult, HelpColors, HelpContext,
-    MetaResult, PreviewColors, PreviewData, PreviewResult, PreviewSettings, SidePanelRender,
-    SortMeta, SortMode, TagResult, VisibleListArgs, DATE_PLACEHOLDER,
+    AppResult, Focus, GitResult, GithubReadmeResult, HelpColors, HelpContext, MetaResult,
+    PreviewColors, PreviewData, PreviewResult, PreviewSettings, SidePanelRender, SortMeta,
+    SortMode, TagResult, VisibleListArgs, DATE_PLACEHOLDER,
 };
+use navgator_core::{copy_to_clipboard, ensure_tty_stdin, write_selection};
 use results::build_items;
-use search::{entry_name, filter_and_sort, index_for_path, parse_query_tokens};
+use search::{filter_and_sort, index_for_path, parse_query_tokens};
 use tags::{
     collect_tag_suggestions, commit_tag_input, ensure_tags_for_paths, read_tags_for_path,
     save_tags_for_path, spawn_bulk_tag_fetch,
@@ -79,27 +82,8 @@ fn main() -> AppResult<()> {
     std::process::exit(2);
 }
 
-fn ensure_tty_stdin() -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        use std::io::IsTerminal;
-        use std::os::unix::io::AsRawFd;
-
-        if io::stdin().is_terminal() {
-            return Ok(());
-        }
-
-        let tty = fs::File::open("/dev/tty")?;
-        let result = unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO) };
-        if result == -1 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
-
 fn print_usage() {
-    eprintln!("Usage:\n  navgator [navigate|config-schema]");
+    eprintln!("Usage:\n  navgator-navigate [navigate|config-schema]");
 }
 
 fn print_config_schema() -> AppResult<()> {
@@ -114,17 +98,6 @@ fn run_navigate() -> AppResult<()> {
         Some(choice) => write_selection(&choice),
         None => std::process::exit(1),
     }
-}
-
-fn write_selection(path: &str) -> AppResult<()> {
-    if let Ok(output_path) = env::var("NAVGATOR_OUTPUT") {
-        if !output_path.is_empty() {
-            fs::write(output_path, path)?;
-            return Ok(());
-        }
-    }
-    println!("{}", path);
-    Ok(())
 }
 
 fn select_from_list(
@@ -164,20 +137,13 @@ fn select_from_list(
     let mut filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
     let mut preview_path: Option<String> = None;
     let mut in_flight: Option<String> = None;
-    let mut preview_text = build_placeholder_text(None, accent, muted, text, "No selection");
-    let mut preview_tab_index = 0usize;
-    let mut preview_tab_visible_index = 0usize;
-    let mut preview_tab_count = 1usize;
-    let mut preview_tab_labels: Vec<String> = Vec::new();
-    let mut worktree_filter = Input::default();
-    let mut detail_tabs: Vec<DetailTab> = Vec::new();
-    let mut detail_tab_index = 0usize;
-    let mut preview_scroll = 0usize;
-    let mut detail_scroll = 0usize;
-    let mut preview_max_scroll = 0usize;
-    let mut detail_max_scroll = 0usize;
-    let mut preview_page_step = 5usize;
-    let mut detail_page_step = 5usize;
+    let mut compositor = CurrentCompositor::new(build_placeholder_text(
+        None,
+        accent,
+        muted,
+        text,
+        "No selection",
+    ));
     let start_time = Instant::now();
     let mut tag_edit_path: Option<String> = None;
     let mut tag_edit_tags: Vec<String> = Vec::new();
@@ -197,7 +163,7 @@ fn select_from_list(
                     data,
                     &mut git_in_flight,
                     &git_tx,
-                    preview_tab_index,
+                    compositor.active_content_index(),
                     PreviewColors {
                         accent,
                         muted,
@@ -209,7 +175,7 @@ fn select_from_list(
                     data,
                     &mut github_in_flight,
                     &github_tx,
-                    preview_tab_index,
+                    compositor.active_content_index(),
                     PreviewColors {
                         accent,
                         muted,
@@ -218,19 +184,7 @@ fn select_from_list(
                 );
             }
             if current.as_deref() == Some(result.path.as_str()) {
-                apply_preview_data(
-                    &result.data,
-                    ApplyPreviewData {
-                        tab_index: &mut preview_tab_index,
-                        tab_visible_index: &mut preview_tab_visible_index,
-                        tab_count: &mut preview_tab_count,
-                        tab_labels: &mut preview_tab_labels,
-                        preview_text: &mut preview_text,
-                        detail_tabs: &mut detail_tabs,
-                        detail_tab_index: &mut detail_tab_index,
-                        worktree_filter: worktree_filter.value(),
-                    },
-                );
+                compositor.apply_preview(&result.data);
                 preview_path = Some(result.path.clone());
             }
             if in_flight.as_deref() == Some(result.path.as_str()) {
@@ -249,19 +203,7 @@ fn select_from_list(
             }
             if updated && current.as_deref() == Some(result.path.as_str()) {
                 if let Some(data) = preview_cache.get(&result.path) {
-                    apply_preview_data(
-                        data,
-                        ApplyPreviewData {
-                            tab_index: &mut preview_tab_index,
-                            tab_visible_index: &mut preview_tab_visible_index,
-                            tab_count: &mut preview_tab_count,
-                            tab_labels: &mut preview_tab_labels,
-                            preview_text: &mut preview_text,
-                            detail_tabs: &mut detail_tabs,
-                            detail_tab_index: &mut detail_tab_index,
-                            worktree_filter: worktree_filter.value(),
-                        },
-                    );
+                    compositor.apply_preview(data);
                 }
             }
         }
@@ -277,19 +219,7 @@ fn select_from_list(
             }
             if updated && current.as_deref() == Some(result.path.as_str()) {
                 if let Some(data) = preview_cache.get(&result.path) {
-                    apply_preview_data(
-                        data,
-                        ApplyPreviewData {
-                            tab_index: &mut preview_tab_index,
-                            tab_visible_index: &mut preview_tab_visible_index,
-                            tab_count: &mut preview_tab_count,
-                            tab_labels: &mut preview_tab_labels,
-                            preview_text: &mut preview_text,
-                            detail_tabs: &mut detail_tabs,
-                            detail_tab_index: &mut detail_tab_index,
-                            worktree_filter: worktree_filter.value(),
-                        },
-                    );
+                    compositor.apply_preview(data);
                 }
             }
         }
@@ -347,52 +277,25 @@ fn select_from_list(
         match current.as_deref() {
             None => {
                 if preview_path.is_some() || in_flight.is_some() {
-                    preview_text =
+                    let placeholder =
                         build_placeholder_text(None, accent, muted, text, "No selection");
-                    detail_tabs.clear();
+                    compositor.reset_for_no_selection(placeholder);
                     preview_path = None;
                     in_flight = None;
-                    preview_tab_index = 0;
-                    preview_tab_visible_index = 0;
-                    detail_tab_index = 0;
-                    preview_tab_count = 1;
-                    preview_tab_labels.clear();
-                    worktree_filter.reset();
-                    preview_scroll = 0;
-                    detail_scroll = 0;
                 }
             }
             Some(path) => {
                 if preview_path.as_deref() != Some(path) {
-                    preview_tab_index = 0;
-                    preview_tab_visible_index = 0;
-                    detail_tab_index = 0;
-                    preview_tab_count = 1;
-                    preview_tab_labels.clear();
-                    worktree_filter.reset();
-                    preview_scroll = 0;
-                    detail_scroll = 0;
+                    compositor.reset_for_new_selection();
                     if let Some(data) = preview_cache.get(path) {
-                        apply_preview_data(
-                            data,
-                            ApplyPreviewData {
-                                tab_index: &mut preview_tab_index,
-                                tab_visible_index: &mut preview_tab_visible_index,
-                                tab_count: &mut preview_tab_count,
-                                tab_labels: &mut preview_tab_labels,
-                                preview_text: &mut preview_text,
-                                detail_tabs: &mut detail_tabs,
-                                detail_tab_index: &mut detail_tab_index,
-                                worktree_filter: worktree_filter.value(),
-                            },
-                        );
+                        compositor.apply_preview(data);
                         preview_path = Some(path.to_string());
                         ensure_git_for_preview(
                             path,
                             data,
                             &mut git_in_flight,
                             &git_tx,
-                            preview_tab_index,
+                            compositor.active_content_index(),
                             PreviewColors {
                                 accent,
                                 muted,
@@ -404,7 +307,7 @@ fn select_from_list(
                             data,
                             &mut github_in_flight,
                             &github_tx,
-                            preview_tab_index,
+                            compositor.active_content_index(),
                             PreviewColors {
                                 accent,
                                 muted,
@@ -412,16 +315,14 @@ fn select_from_list(
                             },
                         );
                     } else if in_flight.as_deref() != Some(path) {
-                        preview_text = build_placeholder_text(
+                        let placeholder = build_placeholder_text(
                             Some(path),
                             accent,
                             muted,
                             text,
                             "Loading preview...",
                         );
-                        detail_tabs.clear();
-                        detail_tab_index = 0;
-                        preview_tab_labels.clear();
+                        compositor.set_loading(placeholder);
                         preview_path = Some(path.to_string());
                         in_flight = Some(path.to_string());
                         let tx = preview_tx.clone();
@@ -444,14 +345,12 @@ fn select_from_list(
             }
         }
 
-        if focus == Focus::Detail && detail_tabs.is_empty() {
-            focus = Focus::Preview;
-        }
+        focus = compositor.ensure_valid_focus(focus);
         if focus == Focus::TagEdit && tag_edit_path.is_none() {
             focus = Focus::Preview;
         }
 
-        let show_detail = !detail_tabs.is_empty();
+        let show_detail = compositor.show_detail();
         let size = terminal.size()?;
         let ui = compute_ui_layout(size.into(), show_detail);
 
@@ -515,6 +414,7 @@ fn select_from_list(
                 offset: list_offset,
                 height: list_inner_height,
                 text,
+                accent,
                 muted,
                 dates: &date_cache,
                 tags: &tag_cache,
@@ -534,19 +434,23 @@ fn select_from_list(
             state.select(list_selected);
             frame.render_stateful_widget(list, results_area, &mut state);
 
-            let preview_body_area = preview_content_area(ui.preview_area, preview_tab_count);
+            let preview_body_area =
+                preview_content_area(ui.preview_area, compositor.preview_tab_count);
             let preview_height = preview_body_area.height as usize;
             let detail_height = ui
                 .detail_panel_area
                 .map(|rect| {
-                    let tab_row = if detail_tabs.len() > 1 { 1 } else { 0 };
+                    let tab_row = if compositor.detail_tabs.len() > 1 {
+                        1
+                    } else {
+                        0
+                    };
                     rect.height.saturating_sub(2).saturating_sub(tab_row) as usize
                 })
                 .unwrap_or(0);
-            preview_page_step = preview_height.max(1);
-            detail_page_step = detail_height.max(1);
-            let preview_title =
-                build_preview_panel_title(current.as_deref(), worktree_filter.value());
+            compositor.preview_page_step = preview_height.max(1);
+            compositor.detail_page_step = detail_height.max(1);
+            let preview_title = compositor.preview_title(current.as_deref());
             let preview_tags = if focus == Focus::TagEdit {
                 tag_edit_tags.clone()
             } else {
@@ -559,7 +463,7 @@ fn select_from_list(
             let preview_width = preview_body_area.width as usize;
             let (preview_combined, tag_cursor) = if focus == Focus::TagEdit {
                 compose_preview_text_with_input(
-                    &preview_text,
+                    &compositor.preview_text,
                     &preview_tags,
                     &tag_input,
                     preview_width,
@@ -567,47 +471,55 @@ fn select_from_list(
                 )
             } else {
                 (
-                    compose_preview_text(&preview_text, &preview_tags, preview_width, text),
+                    compose_preview_text(
+                        &compositor.preview_text,
+                        &preview_tags,
+                        preview_width,
+                        text,
+                    ),
                     None,
                 )
             };
-            preview_max_scroll = text_line_count(&preview_combined).saturating_sub(preview_height);
-            let active_detail = detail_tabs.get(detail_tab_index);
-            detail_max_scroll = active_detail
+            compositor.preview_max_scroll =
+                text_line_count(&preview_combined).saturating_sub(preview_height);
+            let active_detail = compositor.detail_tabs.get(compositor.detail_tab_index);
+            compositor.detail_max_scroll = active_detail
                 .map(|tab| text_line_count(&tab.text).saturating_sub(detail_height))
                 .unwrap_or(0);
             if focus == Focus::TagEdit {
                 if let Some((row, _)) = tag_cursor {
-                    if row < preview_scroll {
-                        preview_scroll = row;
-                    } else if row >= preview_scroll + preview_height {
-                        preview_scroll = row.saturating_sub(preview_height.saturating_sub(1));
+                    if row < compositor.preview_scroll {
+                        compositor.preview_scroll = row;
+                    } else if row >= compositor.preview_scroll + preview_height {
+                        compositor.preview_scroll =
+                            row.saturating_sub(preview_height.saturating_sub(1));
                     }
                 }
             }
-            preview_scroll = preview_scroll.min(preview_max_scroll);
-            detail_scroll = detail_scroll.min(detail_max_scroll);
+            compositor.preview_scroll =
+                compositor.preview_scroll.min(compositor.preview_max_scroll);
+            compositor.detail_scroll = compositor.detail_scroll.min(compositor.detail_max_scroll);
             render_side_panels(
                 frame,
                 SidePanelRender {
                     area: detail_area,
                     preview: &preview_combined,
-                    detail_tabs: &detail_tabs,
-                    detail_tab_index,
+                    detail_tabs: &compositor.detail_tabs,
+                    detail_tab_index: compositor.detail_tab_index,
                     preview_title: &preview_title,
-                    preview_tab_labels: &preview_tab_labels,
-                    preview_tab_index: preview_tab_visible_index,
+                    preview_tab_labels: &compositor.preview_tab_labels,
+                    preview_tab_index: compositor.preview_tab_visible_index,
                     preview_settings,
                     focus,
                     accent,
                     text,
-                    preview_scroll: preview_scroll as u16,
-                    detail_scroll: detail_scroll as u16,
+                    preview_scroll: compositor.preview_scroll as u16,
+                    detail_scroll: compositor.detail_scroll as u16,
                 },
             );
             if focus == Focus::TagEdit {
                 if let Some((row, col)) = tag_cursor {
-                    let visible_row = row.saturating_sub(preview_scroll);
+                    let visible_row = row.saturating_sub(compositor.preview_scroll);
                     if visible_row < preview_height {
                         let x = preview_body_area.x + col as u16;
                         let y = preview_body_area.y + visible_row as u16;
@@ -623,13 +535,13 @@ fn select_from_list(
                     show_detail,
                     cursor_at_end: input_at_end(&input),
                     has_tag_input: !tag_input.value().trim().is_empty(),
-                    preview_tab_index: preview_tab_visible_index,
-                    preview_tab_count,
-                    preview_scroll,
-                    preview_max_scroll,
-                    detail_tab_index,
-                    detail_tab_count: detail_tabs.len(),
-                    detail_scroll,
+                    preview_tab_index: compositor.preview_tab_visible_index,
+                    preview_tab_count: compositor.preview_tab_count,
+                    preview_scroll: compositor.preview_scroll,
+                    preview_max_scroll: compositor.preview_max_scroll,
+                    detail_tab_index: compositor.detail_tab_index,
+                    detail_tab_count: compositor.detail_tabs.len(),
+                    detail_scroll: compositor.detail_scroll,
                 },
                 HelpColors {
                     text,
@@ -663,6 +575,20 @@ fn select_from_list(
                         terminal.show_cursor()?;
                         return Ok(None);
                     }
+                    if key.code == KeyCode::Char('y')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(value) = selection_path_for_action(
+                            focus,
+                            current.as_deref(),
+                            compositor.active_content_index(),
+                            &preview_cache,
+                            current_selection_path(items, &filtered, selected).as_deref(),
+                        ) {
+                            let _ = copy_to_clipboard(&value);
+                        }
+                        continue;
+                    }
                     if key.code == KeyCode::Char('t')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && focus != Focus::TagEdit
@@ -673,18 +599,18 @@ fn select_from_list(
                             tag_input.reset();
                             tag_suggestions = collect_tag_suggestions(&tag_cache);
                             focus = Focus::TagEdit;
-                            preview_scroll = 0;
+                            compositor.preview_scroll = 0;
                         }
                         continue;
                     }
                     if key.code == KeyCode::Enter && focus != Focus::TagEdit {
-                        let value = enter_selection_path(
+                        let value = selection_path_for_action(
                             focus,
                             current.as_deref(),
-                            preview_tab_index,
+                            compositor.active_content_index(),
                             &preview_cache,
-                        )
-                        .or_else(|| filtered.get(selected).map(|index| items[*index].clone()));
+                            current_selection_path(items, &filtered, selected).as_deref(),
+                        );
                         if let Some(value) = value {
                             terminal.show_cursor()?;
                             return Ok(Some(value));
@@ -811,328 +737,38 @@ fn select_from_list(
                                 let _ = tag_input.handle_event(&Event::Key(key));
                             }
                         },
-                        Focus::Preview => match key.code {
-                            KeyCode::Char('u')
-                                if key.modifiers.contains(KeyModifiers::CONTROL)
-                                    && !worktree_filter.value().is_empty() =>
-                            {
-                                worktree_filter.reset();
-                                preview_tab_visible_index = 0;
-                                preview_scroll = 0;
-                                detail_tab_index = 0;
-                                detail_scroll = 0;
-                                if let Some(data) =
-                                    current.as_deref().and_then(|path| preview_cache.get(path))
-                                {
-                                    apply_preview_data(
-                                        data,
-                                        ApplyPreviewData {
-                                            tab_index: &mut preview_tab_index,
-                                            tab_visible_index: &mut preview_tab_visible_index,
-                                            tab_count: &mut preview_tab_count,
-                                            tab_labels: &mut preview_tab_labels,
-                                            preview_text: &mut preview_text,
-                                            detail_tabs: &mut detail_tabs,
-                                            detail_tab_index: &mut detail_tab_index,
-                                            worktree_filter: worktree_filter.value(),
-                                        },
-                                    );
-                                }
+                        Focus::Preview => {
+                            let data = current.as_deref().and_then(|path| preview_cache.get(path));
+                            if let Some(change) = compositor.handle_preview_key(key, data) {
+                                focus = focus_from_change(change);
                             }
-                            KeyCode::Char(_)
-                                if !key.modifiers.intersects(
-                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                                ) =>
-                            {
-                                let before = worktree_filter.value().to_string();
-                                let _ = worktree_filter.handle_event(&Event::Key(key));
-                                if worktree_filter.value() != before {
-                                    preview_tab_visible_index = 0;
-                                    preview_scroll = 0;
-                                    detail_tab_index = 0;
-                                    detail_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                }
+                        }
+                        Focus::Detail => {
+                            let data = current.as_deref().and_then(|path| preview_cache.get(path));
+                            if let Some(change) = compositor.handle_detail_key(key, data) {
+                                focus = focus_from_change(change);
                             }
-                            KeyCode::Backspace if !worktree_filter.value().is_empty() => {
-                                let before = worktree_filter.value().to_string();
-                                let _ = worktree_filter.handle_event(&Event::Key(key));
-                                if worktree_filter.value() != before {
-                                    preview_tab_visible_index = 0;
-                                    preview_scroll = 0;
-                                    detail_tab_index = 0;
-                                    detail_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            KeyCode::Left => {
-                                if preview_tab_visible_index > 0 {
-                                    preview_tab_visible_index -= 1;
-                                    preview_scroll = 0;
-                                    detail_tab_index = 0;
-                                    detail_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        let visible_indexes = preview_tab_visible_indexes(
-                                            data,
-                                            worktree_filter.value(),
-                                        );
-                                        if let Some(index) =
-                                            visible_indexes.get(preview_tab_visible_index)
-                                        {
-                                            preview_tab_index = *index;
-                                        }
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    focus = Focus::Search;
-                                }
-                            }
-                            KeyCode::Right => {
-                                if preview_tab_visible_index + 1 < preview_tab_count {
-                                    preview_tab_visible_index += 1;
-                                    preview_scroll = 0;
-                                    detail_tab_index = 0;
-                                    detail_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        let visible_indexes = preview_tab_visible_indexes(
-                                            data,
-                                            worktree_filter.value(),
-                                        );
-                                        if let Some(index) =
-                                            visible_indexes.get(preview_tab_visible_index)
-                                        {
-                                            preview_tab_index = *index;
-                                        }
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                } else if !detail_tabs.is_empty() {
-                                    focus = Focus::Detail;
-                                }
-                            }
-                            KeyCode::Up => {
-                                if preview_scroll > 0 {
-                                    preview_scroll -= 1;
-                                } else if preview_tab_visible_index > 0 {
-                                    preview_tab_visible_index -= 1;
-                                    detail_tab_index = 0;
-                                    detail_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        let visible_indexes = preview_tab_visible_indexes(
-                                            data,
-                                            worktree_filter.value(),
-                                        );
-                                        if let Some(index) =
-                                            visible_indexes.get(preview_tab_visible_index)
-                                        {
-                                            preview_tab_index = *index;
-                                        }
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                } else if preview_scroll == 0 {
-                                    focus = Focus::Search;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if preview_scroll < preview_max_scroll {
-                                    preview_scroll += 1;
-                                } else if preview_tab_visible_index + 1 < preview_tab_count {
-                                    preview_tab_visible_index += 1;
-                                    preview_scroll = 0;
-                                    detail_tab_index = 0;
-                                    detail_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        let visible_indexes = preview_tab_visible_indexes(
-                                            data,
-                                            worktree_filter.value(),
-                                        );
-                                        if let Some(index) =
-                                            visible_indexes.get(preview_tab_visible_index)
-                                        {
-                                            preview_tab_index = *index;
-                                        }
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                } else if preview_scroll >= preview_max_scroll
-                                    && !detail_tabs.is_empty()
-                                {
-                                    focus = Focus::Detail;
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                preview_scroll = preview_scroll.saturating_sub(preview_page_step);
-                            }
-                            KeyCode::PageDown => {
-                                preview_scroll =
-                                    (preview_scroll + preview_page_step).min(preview_max_scroll);
-                            }
-                            KeyCode::Home => {
-                                preview_scroll = 0;
-                            }
-                            KeyCode::End => {
-                                preview_scroll = preview_max_scroll;
-                            }
-                            _ => {}
-                        },
-                        Focus::Detail => match key.code {
-                            KeyCode::Left => {
-                                if detail_tab_index > 0 {
-                                    detail_tab_index -= 1;
-                                    detail_scroll = 0;
-                                } else {
-                                    preview_tab_visible_index = preview_tab_count.saturating_sub(1);
-                                    preview_scroll = 0;
-                                    if let Some(data) =
-                                        current.as_deref().and_then(|path| preview_cache.get(path))
-                                    {
-                                        let visible_indexes = preview_tab_visible_indexes(
-                                            data,
-                                            worktree_filter.value(),
-                                        );
-                                        if let Some(index) =
-                                            visible_indexes.get(preview_tab_visible_index)
-                                        {
-                                            preview_tab_index = *index;
-                                        }
-                                        apply_preview_data(
-                                            data,
-                                            ApplyPreviewData {
-                                                tab_index: &mut preview_tab_index,
-                                                tab_visible_index: &mut preview_tab_visible_index,
-                                                tab_count: &mut preview_tab_count,
-                                                tab_labels: &mut preview_tab_labels,
-                                                preview_text: &mut preview_text,
-                                                detail_tabs: &mut detail_tabs,
-                                                detail_tab_index: &mut detail_tab_index,
-                                                worktree_filter: worktree_filter.value(),
-                                            },
-                                        );
-                                    }
-                                    focus = Focus::Preview;
-                                }
-                            }
-                            KeyCode::Right => {
-                                if detail_tab_index + 1 < detail_tabs.len() {
-                                    detail_tab_index += 1;
-                                    detail_scroll = 0;
-                                } else {
-                                    focus = Focus::Preview;
-                                }
-                            }
-                            KeyCode::Up => {
-                                if detail_scroll > 0 {
-                                    detail_scroll -= 1;
-                                } else if detail_scroll == 0 {
-                                    focus = Focus::Preview;
-                                }
-                            }
-                            KeyCode::Down if detail_scroll < detail_max_scroll => {
-                                detail_scroll += 1;
-                            }
-                            KeyCode::PageUp => {
-                                detail_scroll = detail_scroll.saturating_sub(detail_page_step);
-                            }
-                            KeyCode::PageDown => {
-                                detail_scroll =
-                                    (detail_scroll + detail_page_step).min(detail_max_scroll);
-                            }
-                            KeyCode::Home => {
-                                detail_scroll = 0;
-                            }
-                            KeyCode::End => {
-                                detail_scroll = detail_max_scroll;
-                            }
-                            _ => {}
-                        },
+                        }
                     }
                 }
+                Event::Paste(value) => match focus {
+                    Focus::Search => {
+                        insert_paste(&mut input, &value);
+                        filtered = filter_and_sort(
+                            items,
+                            input.value(),
+                            sort_mode,
+                            &meta_cache,
+                            &tag_cache,
+                        );
+                        selected = 0;
+                        list_offset = 0;
+                    }
+                    Focus::TagEdit => {
+                        insert_paste(&mut tag_input, &value);
+                    }
+                    Focus::Preview | Focus::Detail => {}
+                },
                 Event::Mouse(mouse) => {
                     let col = mouse.column;
                     let row = mouse.row;
@@ -1152,10 +788,10 @@ fn select_from_list(
                         }
                         MouseEventKind::ScrollUp => {
                             if rect_contains(ui.preview_area, col, row) {
-                                preview_scroll = preview_scroll.saturating_sub(1);
+                                compositor.scroll_preview_up();
                             } else if let Some(detail_panel_area) = ui.detail_panel_area {
                                 if rect_contains(detail_panel_area, col, row) {
-                                    detail_scroll = detail_scroll.saturating_sub(1);
+                                    compositor.scroll_detail_up();
                                 }
                             } else if rect_contains(ui.results_area, col, row) {
                                 selected = selected.saturating_sub(1);
@@ -1163,10 +799,10 @@ fn select_from_list(
                         }
                         MouseEventKind::ScrollDown => {
                             if rect_contains(ui.preview_area, col, row) {
-                                preview_scroll = (preview_scroll + 1).min(preview_max_scroll);
+                                compositor.scroll_preview_down();
                             } else if let Some(detail_panel_area) = ui.detail_panel_area {
                                 if rect_contains(detail_panel_area, col, row) {
-                                    detail_scroll = (detail_scroll + 1).min(detail_max_scroll);
+                                    compositor.scroll_detail_down();
                                 }
                             } else if rect_contains(ui.results_area, col, row) {
                                 selected = selected
@@ -1191,6 +827,20 @@ fn adjust_selected_index(current: usize, len: usize) -> usize {
         len - 1
     } else {
         current
+    }
+}
+
+fn insert_paste(input: &mut Input, value: &str) {
+    for ch in value.chars().filter(|ch| *ch != '\r') {
+        input.handle(InputRequest::InsertChar(ch));
+    }
+}
+
+fn focus_from_change(change: FocusChange) -> Focus {
+    match change {
+        FocusChange::Search => Focus::Search,
+        FocusChange::Preview => Focus::Preview,
+        FocusChange::Detail => Focus::Detail,
     }
 }
 
@@ -1241,16 +891,21 @@ fn enter_selection_path(
         .map(|tab| tab.path.clone())
 }
 
-fn build_preview_panel_title(path: Option<&str>, worktree_filter: &str) -> String {
-    let title = path
-        .map(entry_name)
-        .unwrap_or_else(|| "Preview".to_string());
-    let filter = worktree_filter.trim();
-    if filter.is_empty() {
-        title
-    } else {
-        format!("{} / {}", title, filter)
-    }
+fn selection_path_for_action(
+    focus: Focus,
+    current_path: Option<&str>,
+    preview_tab_index: usize,
+    preview_cache: &HashMap<String, PreviewData>,
+    selected_path: Option<&str>,
+) -> Option<String> {
+    enter_selection_path(focus, current_path, preview_tab_index, preview_cache).or_else(|| {
+        let selected_path = selected_path?;
+        preview_cache
+            .get(selected_path)
+            .and_then(|data| data.previews.first())
+            .map(|tab| tab.path.clone())
+            .or_else(|| Some(selected_path.to_string()))
+    })
 }
 
 fn visible_paths_for_window(
@@ -1275,13 +930,23 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stderr(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
     }
 }
 
 fn setup_terminal() -> AppResult<(Terminal<CrosstermBackend<io::Stderr>>, TerminalGuard)> {
     enable_raw_mode()?;
-    execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        io::stderr(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(io::stderr());
     let terminal = Terminal::new(backend)?;
     Ok((terminal, TerminalGuard))
@@ -1419,6 +1084,17 @@ mod tests {
         assert!(
             enter_selection_path(Focus::Search, Some("/repos/project.git"), 1, &cache).is_none()
         );
+        assert_eq!(
+            selection_path_for_action(
+                Focus::Search,
+                Some("/repos/project.git"),
+                1,
+                &cache,
+                Some("/repos/project.git"),
+            )
+            .as_deref(),
+            Some("/repos/project")
+        );
     }
 
     #[test]
@@ -1514,6 +1190,29 @@ mod tests {
     }
 
     #[test]
+    fn visible_name_match_ranks_before_deep_parent_path_match() {
+        let items = vec![
+            "/repos/Trading Platform Location/Funnel Not Working".to_string(),
+            "/repos/Trading Platform Location".to_string(),
+        ];
+        let filtered = search::filter_and_sort(
+            &items,
+            "trading platform location",
+            SortMode::Match,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(filtered, vec![1, 0]);
+
+        let tokens = search::parse_query_tokens("trading platform location");
+        assert_eq!(
+            search::match_context(&items[0], &[], &tokens).as_deref(),
+            Some("in Trading Platform Location")
+        );
+    }
+
+    #[test]
     fn sorts_default_branch_worktree_first() {
         let trunk = model::GitWorktree {
             path: "/repos/project-trunk".to_string(),
@@ -1559,7 +1258,7 @@ mod tests {
             .as_nanos();
         let root = env::temp_dir().join(format!("navgator-dot-bare-test-{unique}"));
         let dot_bare = root.join(".bare");
-        fs::create_dir_all(&root).expect("test root should be created");
+        std::fs::create_dir_all(&root).expect("test root should be created");
 
         let status = std::process::Command::new("git")
             .arg("init")
@@ -1570,7 +1269,7 @@ mod tests {
         assert!(status.success());
 
         let resolved = git::git_command_dir_for_path(&root);
-        let _ = fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(resolved.as_deref(), Some(dot_bare.as_path()));
     }

@@ -1,15 +1,22 @@
-[package]
-name = "navgator"
+[workspace]
+members = [
+    "crates/navgator-core",
+    "crates/navgator-navigate",
+    "crates/navgator-issues",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-ratatui = "0.30"
-crossterm = "0.29"
+[workspace.dependencies]
 ansi-to-tui = "8.0"
-tui-input = { version = "0.15", features = ["crossterm"] }
-libc = "0.2"
+crossterm = "0.29"
 figment = { version = "0.10", features = ["toml"] }
-serde = { version = "1.0", features = ["derive"] }
+libc = "0.2"
+ratatui = "0.30"
 schemars = { version = "0.8", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tui-input = { version = "0.15", features = ["crossterm"] }

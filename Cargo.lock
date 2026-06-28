@@ -622,13 +622,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "navgator"
+name = "navgator-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "navgator-issues"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "navgator-core",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tui-input",
+]
+
+[[package]]
+name = "navgator-navigate"
 version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "crossterm",
  "figment",
  "libc",
+ "navgator-core",
  "ratatui",
  "schemars",
  "serde",

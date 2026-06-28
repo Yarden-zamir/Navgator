@@ -68,6 +68,35 @@ pub(crate) fn entry_name(path: &str) -> String {
         .to_string()
 }
 
+pub(crate) fn match_context(path: &str, tags: &[String], tokens: &QueryTokens) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let entry = entry_name(path);
+    let mut contexts = Vec::new();
+    for token in tokens.folder.iter().chain(tokens.any.iter()) {
+        if fuzzy_match(token, &entry) {
+            continue;
+        }
+        if let Some(tag) = tags.iter().find(|tag| fuzzy_match(token, tag)) {
+            contexts.push(format!("tag: {tag}"));
+            continue;
+        }
+        if let Some(segment) = best_path_segment_match(token, path) {
+            contexts.push(format!("in {segment}"));
+        }
+    }
+    for token in &tokens.tags {
+        if let Some(tag) = tags.iter().find(|tag| fuzzy_match(token, tag)) {
+            contexts.push(format!("tag: {tag}"));
+        }
+    }
+
+    contexts.dedup();
+    contexts.into_iter().next()
+}
+
 fn filter_indices(
     items: &[String],
     query: &str,
@@ -142,7 +171,9 @@ fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
 
 fn matches_path_token(token: &str, path: &str) -> bool {
     let entry = entry_name(path);
-    fuzzy_match(token, &entry) || fuzzy_match(token, path)
+    fuzzy_match(token, &entry)
+        || best_path_segment_match(token, path).is_some()
+        || fuzzy_match(token, path)
 }
 
 fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Option<MatchScore> {
@@ -205,9 +236,48 @@ fn match_score_for_path(token: &str, path: &str) -> Option<MatchScore> {
     if let Some(score) = match_score(token, &entry) {
         return Some(score);
     }
+    if let Some((mut score, distance_from_entry, _)) = best_path_segment_score(token, path) {
+        score.0 += 8 + distance_from_entry * 3;
+        return Some(score);
+    }
     let mut score = match_score(token, path)?;
-    score.0 += 1;
+    score.0 += 40 + path_depth(path) * 3;
     Some(score)
+}
+
+fn best_path_segment_match(token: &str, path: &str) -> Option<String> {
+    best_path_segment_score(token, path).map(|(_, _, segment)| segment)
+}
+
+fn best_path_segment_score(token: &str, path: &str) -> Option<(MatchScore, usize, String)> {
+    let mut segments = Path::new(path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<&str>>();
+    if segments.len() <= 1 {
+        return None;
+    }
+    segments.pop();
+
+    let mut best: Option<(MatchScore, usize, String)> = None;
+    for (distance, segment) in segments.iter().rev().enumerate() {
+        let Some(score) = match_score(token, segment) else {
+            continue;
+        };
+        best = match best {
+            Some(existing) if existing.0 <= score => Some(existing),
+            _ => Some((score, distance + 1, (*segment).to_string())),
+        };
+    }
+    best
+}
+
+fn path_depth(path: &str) -> usize {
+    Path::new(path)
+        .components()
+        .filter(|component| !component.as_os_str().is_empty())
+        .count()
 }
 
 fn sort_indices(

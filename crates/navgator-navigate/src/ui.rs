@@ -3,7 +3,7 @@ use crate::model::{
     Focus, HelpColors, HelpContext, PreviewSettings, SidePanelRender, UiLayout, VisibleListArgs,
     DATE_PLACEHOLDER, MIN_PARTIAL_TAB_WIDTH, TAB_DIVIDER_WIDTH,
 };
-use crate::search::{entry_name, fuzzy_match, QueryTokens};
+use crate::search::{entry_name, fuzzy_match, match_context, QueryTokens};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -42,7 +42,9 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
                 regular_style,
             ));
             spans.push(Span::styled("Ctrl+U", key_style));
-            spans.push(Span::styled(" clear", regular_style));
+            spans.push(Span::styled(" clear  ", regular_style));
+            spans.push(Span::styled("Ctrl+Y", key_style));
+            spans.push(Span::styled(" copy", regular_style));
         }
         Focus::Preview => {
             let label = if context.preview_tab_count > 1 {
@@ -71,6 +73,8 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             }
             spans.push(Span::styled("Ctrl+T", key_style));
             spans.push(Span::styled(" tag  ", regular_style));
+            spans.push(Span::styled("Ctrl+Y", key_style));
+            spans.push(Span::styled(" copy  ", regular_style));
             if context.preview_scroll == 0 && !has_prev_preview {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" search  ", regular_style));
@@ -109,6 +113,8 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             }
             spans.push(Span::styled("Ctrl+T", key_style));
             spans.push(Span::styled(" tag  ", regular_style));
+            spans.push(Span::styled("Ctrl+Y", key_style));
+            spans.push(Span::styled(" copy  ", regular_style));
             if context.detail_scroll == 0 {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" preview", regular_style));
@@ -225,28 +231,53 @@ pub(crate) fn build_visible_list_items(
         let date_display = format_date_display(date_value);
         let date_len = date_display.chars().count();
         let tag_list = args.tags.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        let max_entry = args.inner_width.saturating_sub(date_len + 1);
+        let context = match_context(path, tag_list, args.tokens);
+        let context_len = context
+            .as_ref()
+            .map(|value| value.chars().count() + 1)
+            .unwrap_or(0);
+        let max_entry = args.inner_width.saturating_sub(date_len + context_len + 1);
         let mut entry_display = truncate_with_ellipsis(&entry, max_entry);
         let mut entry_len = entry_display.chars().count();
-        if entry_len + date_len + 1 > args.inner_width {
-            let new_len = args.inner_width.saturating_sub(date_len + 1);
+        if entry_len + date_len + context_len + 1 > args.inner_width {
+            let new_len = args.inner_width.saturating_sub(date_len + context_len + 1);
             entry_display = truncate_with_ellipsis(&entry, new_len);
             entry_len = entry_display.chars().count();
         }
 
-        let remaining = args.inner_width.saturating_sub(entry_len + date_len);
-        let tag_space = remaining.saturating_sub(1);
-        let (tag_spans, tag_len) = if tag_space > 0 {
+        let remaining = args
+            .inner_width
+            .saturating_sub(entry_len + date_len + context_len);
+        let tag_space = if context.is_none() {
+            remaining.saturating_sub(1)
+        } else {
+            0
+        };
+        let (tag_spans, tag_len) = if tag_space > 0 && context.is_none() {
             build_tag_spans(tag_list, args.tokens, tag_space, args.elapsed_ms, args.text)
         } else {
             (Vec::new(), 0)
         };
         let tag_block_len = if tag_len > 0 { tag_len + 1 } else { 0 };
-        let right_block_len = date_len + tag_block_len;
+        let right_block_len = date_len + tag_block_len + context_len;
         let padding = args.inner_width.saturating_sub(entry_len + right_block_len);
         let mut spans = Vec::new();
-        spans.push(Span::styled(entry_display, Style::default().fg(args.text)));
+        spans.extend(highlight_match_spans(
+            &entry_display,
+            entry_match_tokens(args.tokens),
+            args.text,
+            args.accent,
+        ));
         spans.push(Span::raw(" ".repeat(padding)));
+        if let Some(context) = context {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                context,
+                Style::default()
+                    .fg(args.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if tag_len > 0 {
             spans.push(Span::raw(" "));
             spans.extend(tag_spans);
@@ -395,6 +426,93 @@ fn truncate_with_ellipsis(value: &str, max: usize) -> String {
     }
     let trimmed: String = value.chars().take(max - 3).collect();
     format!("{}...", trimmed)
+}
+
+fn entry_match_tokens(tokens: &QueryTokens) -> Vec<&str> {
+    tokens
+        .folder
+        .iter()
+        .chain(tokens.any.iter())
+        .map(String::as_str)
+        .collect()
+}
+
+fn highlight_match_spans(
+    value: &str,
+    tokens: Vec<&str>,
+    text: Color,
+    accent: Color,
+) -> Vec<Span<'static>> {
+    if value.is_empty() || tokens.is_empty() {
+        return vec![Span::styled(value.to_string(), Style::default().fg(text))];
+    }
+
+    let mut highlighted = vec![false; value.chars().count()];
+    for token in tokens {
+        for index in fuzzy_match_indices(token, value) {
+            if let Some(slot) = highlighted.get_mut(index) {
+                *slot = true;
+            }
+        }
+    }
+
+    let normal = Style::default().fg(text);
+    let matched = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let mut current_highlight = None;
+
+    for (index, ch) in value.chars().enumerate() {
+        let is_highlighted = highlighted.get(index).copied().unwrap_or(false);
+        if current_highlight == Some(is_highlighted) {
+            current.push(ch);
+            continue;
+        }
+        if !current.is_empty() {
+            let style = if current_highlight.unwrap_or(false) {
+                matched
+            } else {
+                normal
+            };
+            spans.push(Span::styled(current.clone(), style));
+            current.clear();
+        }
+        current_highlight = Some(is_highlighted);
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        let style = if current_highlight.unwrap_or(false) {
+            matched
+        } else {
+            normal
+        };
+        spans.push(Span::styled(current, style));
+    }
+    spans
+}
+
+fn fuzzy_match_indices(query: &str, value: &str) -> Vec<usize> {
+    let mut query_chars = query.chars().filter(|ch| !ch.is_whitespace());
+    let mut current = query_chars.next();
+    if current.is_none() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for (index, ch) in value.chars().enumerate() {
+        let Some(expected) = current else {
+            break;
+        };
+        if expected.eq_ignore_ascii_case(&ch) {
+            matches.push(index);
+            current = query_chars.next();
+            if current.is_none() {
+                return matches;
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn build_tag_spans(

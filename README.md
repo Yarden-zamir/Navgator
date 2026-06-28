@@ -1,19 +1,25 @@
 # navgator
 
-Rust TUI directory picker with search, tags, and previews. Prints the selected path to stdout.
+Rust TUI tools for project navigation and GitHub issue exploration. Shared generic helpers live in `navgator-core`; each TUI is its own binary crate.
 
 ![navgator screenshot](Screenshot.png)
 
 ## Build
 
 ```
-cargo build --release
+cargo build --release --workspace
 ```
 
 ## Run
 
 ```
-./target/release/navgator navigate
+./target/release/navgator-navigate
+```
+
+Explore GitHub issues for the repo in the current folder:
+
+```
+./target/release/navgator-issues
 ```
 
 ## Zsh wrapper
@@ -65,9 +71,20 @@ Sorting by time triggers background metadata scans.
 
 - Search panel (left) edits query.
 - Preview panel (right top) shows path and `erd` tree.
-- Git panel (right bottom) shows branch, recent commits, diff stats, and untracked files.
+- Details panel (right bottom) tabs GitHub README/repo summary and Git details when available.
 - Right/Left switch focus between panels; Up/Down scroll within panels.
 - Mouse click focuses a panel; mouse wheel scrolls.
+
+## GitHub issues
+
+`navgator-issues` uses `gh` and the current repo's `origin` remote to show issues in a separate TUI.
+
+- Type to filter by title, body, number, or labels.
+- `#term` filters issue numbers and labels.
+- `@term` filters authors and assignees.
+- `Tab` cycles open, closed, and all issues.
+- `r` refreshes from GitHub.
+- `Enter` prints the selected issue URL.
 
 ## Preview tooling
 
@@ -112,5 +129,5 @@ If an existing config contains `[paths]` but no `"$schema"`, navgator prepends t
 Schema file is generated from the Rust config structs:
 
 ```
-cargo run -- config-schema > config-schema.json
+cargo run -p navgator-navigate -- config-schema > config-schema.json
 ```

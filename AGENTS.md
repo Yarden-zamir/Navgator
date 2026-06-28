@@ -2,26 +2,28 @@
 
 ## Project Shape
 
-- Single Rust binary crate with active modules wired from `src/main.rs`; do not add duplicate inactive split modules.
-- Current split: `config.rs` (config/schema), `results.rs` (project results), `metadata.rs` (date metadata), `tags.rs` (local tag metadata/actions), `git.rs` (Git/worktree service), `content.rs` (folder/worktree/Git content providers), `ui.rs` (layout/rendering/tab composition), `search.rs` (query/filter/sort), `commands.rs` (external command helpers), and `model.rs` (shared types/provider-model scaffolding).
-- Runtime entrypoints: `navgator` and `navgator navigate` run the TUI; `navgator config-schema`/`schema` prints JSON schema.
+- Cargo workspace with one small shared library and two implementation crates.
+- `crates/navgator-core`: generic helpers only (`AppResult`, selection output, tty setup, generic command output, fuzzy match). Do not put Git, GitHub, content-provider, config, tag, or TUI-compositor behavior here.
+- `crates/navgator-navigate`: project navigator implementation. Git, GitHub README, folder/worktree content, config, tags, metadata, search ranking/explanations, compositor, and UI are implementation-specific here.
+- `crates/navgator-issues`: GitHub issue explorer implementation. It owns its own Git/GitHub helpers and issue-specific streaming/compositor/UI behavior, even where that duplicates navigate behavior.
+- Runtime entrypoints: `navgator-navigate` runs the project navigator TUI; `navgator-issues` runs a GitHub issue explorer for the current repo; `navgator-navigate config-schema`/`schema` prints JSON schema.
 
 ## Commands
 
-- Fast compile check: `cargo check`
-- Release build used by the wrapper fallback: `cargo build --release`
+- Fast compile check: `cargo check --workspace`
+- Release build used by the wrapper fallback: `cargo build --release --workspace`
 - Format check: `cargo fmt -- --check`
 - Apply formatting: `cargo fmt`
-- Strict lint: `cargo clippy --all-targets --all-features -- -D warnings`
-- Tests: `cargo test`; focused tests use `cargo test <test_name>`
-- Generate schema after config struct changes: `cargo run -- config-schema > config-schema.json`
+- Strict lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- Tests: `cargo test --workspace`; focused tests use `cargo test -p <crate> <test_name>`
+- Generate schema after config struct changes: `cargo run -p navgator-navigate -- config-schema > config-schema.json`
 
 ## Running Locally
 
-- TUI run: `cargo run -- navigate`
-- Release binary run: `./target/release/navgator navigate`
+- TUI run: `cargo run -p navgator-navigate`; issue explorer run: `cargo run -p navgator-issues`
+- Release binary run: `./target/release/navgator-navigate` or `./target/release/navgator-issues`
 - Zsh wrapper: `source /Users/kcw/GitHub/navgator/scripts/navgator.zsh`, then bind/use `navigate`.
-- Wrapper binary lookup order is `$NAVGATOR_BIN`, `navgator` on `PATH`, `target/release/navgator`, then `target/debug/navgator`.
+- Wrapper binary lookup order is `$NAVGATOR_BIN`, `navgator-navigate` on `PATH`, `target/release/navgator-navigate`, then `target/debug/navgator-navigate`.
 - Wrapper passes the selected path via `NAVGATOR_OUTPUT`; otherwise the binary prints the selected path to stdout.
 
 ## Config Behavior

@@ -1,0 +1,16 @@
+[package]
+name = "navgator-navigate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ansi-to-tui.workspace = true
+crossterm.workspace = true
+figment.workspace = true
+libc.workspace = true
+navgator-core = { path = "../navgator-core" }
+ratatui.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tui-input.workspace = true
