@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use ratatui::{layout::Rect, style::Color, text::Text};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
 pub(crate) type AppResult<T> = Result<T, Box<dyn Error>>;
@@ -182,8 +183,22 @@ pub(crate) struct DetailTab {
 }
 
 pub(crate) struct BuildItemsResult {
-    pub(crate) items: Vec<String>,
+    pub(crate) entries: Vec<NavigateEntry>,
     pub(crate) preview_settings: PreviewSettings,
+}
+
+pub(crate) enum ResultUpdate {
+    Entries {
+        entries: Vec<NavigateEntry>,
+    },
+    ReplaceProviderEntries {
+        provider_prefix: String,
+        entries: Vec<NavigateEntry>,
+    },
+    Status {
+        provider_id: String,
+        message: String,
+    },
 }
 
 pub(crate) struct LoadedConfig {
@@ -271,7 +286,7 @@ pub(crate) struct HelpColors {
 }
 
 pub(crate) struct VisibleListArgs<'a> {
-    pub(crate) items: &'a [String],
+    pub(crate) entries: &'a [NavigateEntry],
     pub(crate) filtered: &'a [usize],
     pub(crate) selected: usize,
     pub(crate) offset: usize,
@@ -311,4 +326,22 @@ pub(crate) struct UiLayout {
     pub(crate) preview_area: Rect,
     pub(crate) detail_panel_area: Option<Rect>,
     pub(crate) help_area: Rect,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum NavigateEntryKind {
+    Project,
+    Worktree { repo_label: String, branch: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct NavigateEntry {
+    pub(crate) id: String,
+    pub(crate) display: String,
+    pub(crate) context: Option<String>,
+    pub(crate) preview_root_path: String,
+    pub(crate) preferred_preview_path: Option<String>,
+    pub(crate) selection_path: String,
+    pub(crate) metadata_path: String,
+    pub(crate) search_text: Vec<String>,
+    pub(crate) kind: NavigateEntryKind,
 }

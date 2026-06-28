@@ -1,4 +1,4 @@
-use crate::model::{MatchScore, SortMeta, SortMode};
+use crate::model::{MatchScore, NavigateEntry, SortMeta, SortMode};
 use std::{cmp::Ordering, collections::HashMap, path::Path};
 
 #[derive(Default)]
@@ -14,7 +14,7 @@ impl QueryTokens {
     }
 
     pub(crate) fn needs_tags(&self) -> bool {
-        !self.tags.is_empty() || !self.any.is_empty()
+        !self.tags.is_empty()
     }
 }
 
@@ -37,25 +37,29 @@ pub(crate) fn parse_query_tokens(query: &str) -> QueryTokens {
 }
 
 pub(crate) fn filter_and_sort(
-    items: &[String],
+    entries: &[NavigateEntry],
     query: &str,
     sort_mode: SortMode,
     meta_cache: &HashMap<String, SortMeta>,
     tag_cache: &HashMap<String, Vec<String>>,
 ) -> Vec<usize> {
     if sort_mode == SortMode::Match {
-        return filter_and_sort_by_match(items, query, tag_cache);
+        return filter_and_sort_by_match(entries, query, tag_cache);
     }
-    let mut indices = filter_indices(items, query, tag_cache);
-    sort_indices(&mut indices, items, sort_mode, meta_cache);
+    let mut indices = filter_indices(entries, query, tag_cache);
+    sort_indices(&mut indices, entries, sort_mode, meta_cache);
     indices
 }
 
-pub(crate) fn index_for_path(items: &[String], filtered: &[usize], path: &str) -> Option<usize> {
+pub(crate) fn index_for_entry_id(
+    entries: &[NavigateEntry],
+    filtered: &[usize],
+    id: &str,
+) -> Option<usize> {
     filtered.iter().position(|index| {
-        items
+        entries
             .get(*index)
-            .map(|candidate| candidate == path)
+            .map(|candidate| candidate.id == id)
             .unwrap_or(false)
     })
 }
@@ -68,23 +72,19 @@ pub(crate) fn entry_name(path: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn match_context(path: &str, tags: &[String], tokens: &QueryTokens) -> Option<String> {
+pub(crate) fn entry_match_context(
+    entry: &NavigateEntry,
+    tags: &[String],
+    tokens: &QueryTokens,
+) -> Option<String> {
     if tokens.is_empty() {
         return None;
     }
 
-    let entry = entry_name(path);
     let mut contexts = Vec::new();
     for token in tokens.folder.iter().chain(tokens.any.iter()) {
-        if fuzzy_match(token, &entry) {
+        if fuzzy_match(token, &entry.display) {
             continue;
-        }
-        if let Some(tag) = tags.iter().find(|tag| fuzzy_match(token, tag)) {
-            contexts.push(format!("tag: {tag}"));
-            continue;
-        }
-        if let Some(segment) = best_path_segment_match(token, path) {
-            contexts.push(format!("in {segment}"));
         }
     }
     for token in &tokens.tags {
@@ -98,20 +98,23 @@ pub(crate) fn match_context(path: &str, tags: &[String], tokens: &QueryTokens) -
 }
 
 fn filter_indices(
-    items: &[String],
+    entries: &[NavigateEntry],
     query: &str,
     tag_cache: &HashMap<String, Vec<String>>,
 ) -> Vec<usize> {
     let tokens = parse_query_tokens(query);
     if tokens.is_empty() {
-        return (0..items.len()).collect();
+        return (0..entries.len()).collect();
     }
-    items
+    entries
         .iter()
         .enumerate()
-        .filter_map(|(index, path)| {
-            let tags = tag_cache.get(path).map(Vec::as_slice).unwrap_or(&[]);
-            if matches_tokens(path, tags, &tokens) {
+        .filter_map(|(index, entry)| {
+            let tags = tag_cache
+                .get(&entry.metadata_path)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if matches_entry_tokens(entry, tags, &tokens) {
                 Some(index)
             } else {
                 None
@@ -121,36 +124,39 @@ fn filter_indices(
 }
 
 fn filter_and_sort_by_match(
-    items: &[String],
+    entries: &[NavigateEntry],
     query: &str,
     tag_cache: &HashMap<String, Vec<String>>,
 ) -> Vec<usize> {
     let tokens = parse_query_tokens(query);
     if tokens.is_empty() {
-        return (0..items.len()).collect();
+        return (0..entries.len()).collect();
     }
     let mut scored: Vec<(usize, MatchScore)> = Vec::new();
-    for (index, path) in items.iter().enumerate() {
-        let tags = tag_cache.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        if !matches_tokens(path, tags, &tokens) {
+    for (index, entry) in entries.iter().enumerate() {
+        let tags = tag_cache
+            .get(&entry.metadata_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if !matches_entry_tokens(entry, tags, &tokens) {
             continue;
         }
-        if let Some(score) = match_score_tokens(&tokens, path, tags) {
+        if let Some(score) = match_score_entry_tokens(&tokens, entry, tags) {
             scored.push((index, score));
         }
     }
     scored.sort_by(|(left_idx, left), (right_idx, right)| {
         left.cmp(right).then_with(|| {
-            compare_names(&items[*left_idx], &items[*right_idx])
+            compare_entry_names(&entries[*left_idx], &entries[*right_idx])
                 .then_with(|| left_idx.cmp(right_idx))
         })
     });
     scored.into_iter().map(|(index, _)| index).collect()
 }
 
-fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
+fn matches_entry_tokens(entry: &NavigateEntry, tags: &[String], tokens: &QueryTokens) -> bool {
     for token in &tokens.folder {
-        if !matches_path_token(token, path) {
+        if !matches_entry_text_token(token, entry) {
             return false;
         }
     }
@@ -160,23 +166,23 @@ fn matches_tokens(path: &str, tags: &[String], tokens: &QueryTokens) -> bool {
         }
     }
     for token in &tokens.any {
-        let path_match = matches_path_token(token, path);
-        let tag_match = tags.iter().any(|tag| fuzzy_match(token, tag));
-        if !path_match && !tag_match {
+        let entry_match = matches_entry_text_token(token, entry);
+        if !entry_match {
             return false;
         }
     }
     true
 }
 
-fn matches_path_token(token: &str, path: &str) -> bool {
-    let entry = entry_name(path);
-    fuzzy_match(token, &entry)
-        || best_path_segment_match(token, path).is_some()
-        || fuzzy_match(token, path)
+fn matches_entry_text_token(token: &str, entry: &NavigateEntry) -> bool {
+    fuzzy_match(token, &entry.display)
 }
 
-fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Option<MatchScore> {
+fn match_score_entry_tokens(
+    tokens: &QueryTokens,
+    entry: &NavigateEntry,
+    tags: &[String],
+) -> Option<MatchScore> {
     let mut penalty_sum = 0usize;
     let mut span_sum = 0usize;
     let mut gap_sum = 0usize;
@@ -184,7 +190,7 @@ fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Opti
     let mut len_sum = 0usize;
 
     for token in &tokens.folder {
-        let score = match_score_for_path(token, path)?;
+        let score = match_score_for_entry(token, entry)?;
         penalty_sum += score.0;
         span_sum += score.1;
         gap_sum += score.2;
@@ -200,14 +206,7 @@ fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Opti
         len_sum += score.4;
     }
     for token in &tokens.any {
-        let path_score = match_score_for_path(token, path);
-        let tag_score = best_tag_score(token, tags);
-        let score = match (path_score, tag_score) {
-            (Some(path), Some(tag)) => path.min(tag),
-            (Some(path), None) => path,
-            (None, Some(tag)) => tag,
-            (None, None) => return None,
-        };
+        let score = match_score_for_entry(token, entry)?;
         penalty_sum += score.0;
         span_sum += score.1;
         gap_sum += score.2;
@@ -216,6 +215,10 @@ fn match_score_tokens(tokens: &QueryTokens, path: &str, tags: &[String]) -> Opti
     }
 
     Some((penalty_sum, span_sum, gap_sum, start_sum, len_sum))
+}
+
+fn match_score_for_entry(token: &str, entry: &NavigateEntry) -> Option<MatchScore> {
+    match_score(token, &entry.display)
 }
 
 fn best_tag_score(token: &str, tags: &[String]) -> Option<MatchScore> {
@@ -231,84 +234,41 @@ fn best_tag_score(token: &str, tags: &[String]) -> Option<MatchScore> {
     best
 }
 
-fn match_score_for_path(token: &str, path: &str) -> Option<MatchScore> {
-    let entry = entry_name(path);
-    if let Some(score) = match_score(token, &entry) {
-        return Some(score);
-    }
-    if let Some((mut score, distance_from_entry, _)) = best_path_segment_score(token, path) {
-        score.0 += 8 + distance_from_entry * 3;
-        return Some(score);
-    }
-    let mut score = match_score(token, path)?;
-    score.0 += 40 + path_depth(path) * 3;
-    Some(score)
-}
-
-fn best_path_segment_match(token: &str, path: &str) -> Option<String> {
-    best_path_segment_score(token, path).map(|(_, _, segment)| segment)
-}
-
-fn best_path_segment_score(token: &str, path: &str) -> Option<(MatchScore, usize, String)> {
-    let mut segments = Path::new(path)
-        .components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<&str>>();
-    if segments.len() <= 1 {
-        return None;
-    }
-    segments.pop();
-
-    let mut best: Option<(MatchScore, usize, String)> = None;
-    for (distance, segment) in segments.iter().rev().enumerate() {
-        let Some(score) = match_score(token, segment) else {
-            continue;
-        };
-        best = match best {
-            Some(existing) if existing.0 <= score => Some(existing),
-            _ => Some((score, distance + 1, (*segment).to_string())),
-        };
-    }
-    best
-}
-
-fn path_depth(path: &str) -> usize {
-    Path::new(path)
-        .components()
-        .filter(|component| !component.as_os_str().is_empty())
-        .count()
-}
-
 fn sort_indices(
     indices: &mut [usize],
-    items: &[String],
+    entries: &[NavigateEntry],
     sort_mode: SortMode,
     meta_cache: &HashMap<String, SortMeta>,
 ) {
-    indices.sort_by(|left, right| compare_indices(*left, *right, items, sort_mode, meta_cache));
+    indices.sort_by(|left, right| compare_indices(*left, *right, entries, sort_mode, meta_cache));
 }
 
 fn compare_indices(
     left: usize,
     right: usize,
-    items: &[String],
+    entries: &[NavigateEntry],
     sort_mode: SortMode,
     meta_cache: &HashMap<String, SortMeta>,
 ) -> Ordering {
-    let left_path = &items[left];
-    let right_path = &items[right];
+    let left_entry = &entries[left];
+    let right_entry = &entries[right];
+    let left_path = &left_entry.metadata_path;
+    let right_path = &right_entry.metadata_path;
     match sort_mode {
         SortMode::Match => Ordering::Equal,
-        SortMode::AlphaAsc => compare_names(left_path, right_path).then_with(|| left.cmp(&right)),
-        SortMode::AlphaDesc => compare_names(right_path, left_path).then_with(|| left.cmp(&right)),
+        SortMode::AlphaAsc => {
+            compare_entry_names(left_entry, right_entry).then_with(|| left.cmp(&right))
+        }
+        SortMode::AlphaDesc => {
+            compare_entry_names(right_entry, left_entry).then_with(|| left.cmp(&right))
+        }
         SortMode::CreatedAsc => {
             compare_time(left_path, right_path, meta_cache, TimeField::Created, false)
-                .then_with(|| compare_names(left_path, right_path))
+                .then_with(|| compare_entry_names(left_entry, right_entry))
         }
         SortMode::CreatedDesc => {
             compare_time(left_path, right_path, meta_cache, TimeField::Created, true)
-                .then_with(|| compare_names(left_path, right_path))
+                .then_with(|| compare_entry_names(left_entry, right_entry))
         }
         SortMode::ModifiedAsc => compare_time(
             left_path,
@@ -317,18 +277,18 @@ fn compare_indices(
             TimeField::Modified,
             false,
         )
-        .then_with(|| compare_names(left_path, right_path)),
+        .then_with(|| compare_entry_names(left_entry, right_entry)),
         SortMode::ModifiedDesc => {
             compare_time(left_path, right_path, meta_cache, TimeField::Modified, true)
-                .then_with(|| compare_names(left_path, right_path))
+                .then_with(|| compare_entry_names(left_entry, right_entry))
         }
     }
 }
 
-fn compare_names(left: &str, right: &str) -> Ordering {
-    entry_name(left)
+fn compare_entry_names(left: &NavigateEntry, right: &NavigateEntry) -> Ordering {
+    left.display
         .to_lowercase()
-        .cmp(&entry_name(right).to_lowercase())
+        .cmp(&right.display.to_lowercase())
 }
 
 enum TimeField {

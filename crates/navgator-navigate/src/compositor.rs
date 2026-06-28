@@ -222,6 +222,21 @@ impl CurrentCompositor {
         self.detail_scroll = (self.detail_scroll + 1).min(self.detail_max_scroll);
     }
 
+    pub(crate) fn select_preview_path(&mut self, data: &PreviewData, preferred_path: &str) {
+        let Some(index) = data
+            .previews
+            .iter()
+            .position(|tab| tab.path == preferred_path)
+        else {
+            return;
+        };
+        self.preview_tab_index = index;
+        self.preview_scroll = 0;
+        self.detail_tab_index = 0;
+        self.detail_scroll = 0;
+        self.apply_preview(data);
+    }
+
     fn reset_active_preview_position(&mut self) {
         self.preview_tab_visible_index = 0;
         self.preview_scroll = 0;

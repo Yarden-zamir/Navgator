@@ -3,7 +3,7 @@ use crate::model::{
     Focus, HelpColors, HelpContext, PreviewSettings, SidePanelRender, UiLayout, VisibleListArgs,
     DATE_PLACEHOLDER, MIN_PARTIAL_TAB_WIDTH, TAB_DIVIDER_WIDTH,
 };
-use crate::search::{entry_name, fuzzy_match, match_context, QueryTokens};
+use crate::search::{entry_match_context, fuzzy_match, QueryTokens};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -221,27 +221,35 @@ pub(crate) fn build_visible_list_items(
     let mut list_items = Vec::with_capacity(visible.len());
 
     for item_index in visible.iter() {
-        let path = &args.items[*item_index];
-        let entry = entry_name(path);
+        let entry = &args.entries[*item_index];
+        let metadata_path = &entry.metadata_path;
+        let display = &entry.display;
         let date_value = args
             .dates
-            .get(path)
+            .get(metadata_path)
             .map(String::as_str)
             .unwrap_or(DATE_PLACEHOLDER);
         let date_display = format_date_display(date_value);
         let date_len = date_display.chars().count();
-        let tag_list = args.tags.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        let context = match_context(path, tag_list, args.tokens);
+        let tag_list = args
+            .tags
+            .get(metadata_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let context = entry
+            .context
+            .clone()
+            .or_else(|| entry_match_context(entry, tag_list, args.tokens));
         let context_len = context
             .as_ref()
             .map(|value| value.chars().count() + 1)
             .unwrap_or(0);
         let max_entry = args.inner_width.saturating_sub(date_len + context_len + 1);
-        let mut entry_display = truncate_with_ellipsis(&entry, max_entry);
+        let mut entry_display = truncate_with_ellipsis(display, max_entry);
         let mut entry_len = entry_display.chars().count();
         if entry_len + date_len + context_len + 1 > args.inner_width {
             let new_len = args.inner_width.saturating_sub(date_len + context_len + 1);
-            entry_display = truncate_with_ellipsis(&entry, new_len);
+            entry_display = truncate_with_ellipsis(display, new_len);
             entry_len = entry_display.chars().count();
         }
 
@@ -449,7 +457,7 @@ fn highlight_match_spans(
 
     let mut highlighted = vec![false; value.chars().count()];
     for token in tokens {
-        for index in fuzzy_match_indices(token, value) {
+        for index in match_indices(token, value) {
             if let Some(slot) = highlighted.get_mut(index) {
                 *slot = true;
             }
@@ -490,6 +498,25 @@ fn highlight_match_spans(
         spans.push(Span::styled(current, style));
     }
     spans
+}
+
+fn match_indices(query: &str, value: &str) -> Vec<usize> {
+    exact_match_indices(query, value).unwrap_or_else(|| fuzzy_match_indices(query, value))
+}
+
+fn exact_match_indices(query: &str, value: &str) -> Option<Vec<usize>> {
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let value_lower = value.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let start_byte = value_lower.find(&query_lower)?;
+    let start = value
+        .char_indices()
+        .take_while(|(byte_index, _)| *byte_index < start_byte)
+        .count();
+    let len = query.chars().count();
+    Some((start..start + len).collect())
 }
 
 fn fuzzy_match_indices(query: &str, value: &str) -> Vec<usize> {

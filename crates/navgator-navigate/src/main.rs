@@ -32,6 +32,7 @@ mod git;
 mod github;
 mod metadata;
 mod model;
+mod provider_runtime;
 mod results;
 mod search;
 mod tags;
@@ -47,12 +48,12 @@ use github::ensure_github_readme_for_preview;
 use metadata::{ensure_dates_for_paths, spawn_bulk_metadata_fetch};
 use model::{
     AppResult, Focus, GitResult, GithubReadmeResult, HelpColors, HelpContext, MetaResult,
-    PreviewColors, PreviewData, PreviewResult, PreviewSettings, SidePanelRender, SortMeta,
-    SortMode, TagResult, VisibleListArgs, DATE_PLACEHOLDER,
+    NavigateEntry, PreviewColors, PreviewData, PreviewResult, PreviewSettings, ResultUpdate,
+    SidePanelRender, SortMeta, SortMode, TagResult, VisibleListArgs, DATE_PLACEHOLDER,
 };
 use navgator_core::{copy_to_clipboard, ensure_tty_stdin, write_selection};
-use results::build_items;
-use search::{filter_and_sort, index_for_path, parse_query_tokens};
+use results::{build_items, spawn_worktree_result_provider};
+use search::{filter_and_sort, index_for_entry_id, parse_query_tokens};
 use tags::{
     collect_tag_suggestions, commit_tag_input, ensure_tags_for_paths, read_tags_for_path,
     save_tags_for_path, spawn_bulk_tag_fetch,
@@ -94,7 +95,7 @@ fn print_config_schema() -> AppResult<()> {
 
 fn run_navigate() -> AppResult<()> {
     let result = build_items()?;
-    match select_from_list("Navigate", &result.items, result.preview_settings)? {
+    match select_from_list("Navigate", result.entries, result.preview_settings)? {
         Some(choice) => write_selection(&choice),
         None => std::process::exit(1),
     }
@@ -102,10 +103,10 @@ fn run_navigate() -> AppResult<()> {
 
 fn select_from_list(
     _title: &str,
-    items: &[String],
+    mut entries: Vec<NavigateEntry>,
     preview_settings: PreviewSettings,
 ) -> AppResult<Option<String>> {
-    if items.is_empty() {
+    if entries.is_empty() {
         return Ok(None);
     }
 
@@ -126,6 +127,7 @@ fn select_from_list(
     let (github_tx, github_rx) = mpsc::channel::<GithubReadmeResult>();
     let (date_tx, date_rx) = mpsc::channel::<MetaResult>();
     let (tag_tx, tag_rx) = mpsc::channel::<TagResult>();
+    let (result_tx, result_rx) = mpsc::channel::<ResultUpdate>();
     let mut preview_cache: HashMap<String, PreviewData> = HashMap::new();
     let mut git_in_flight: HashSet<String> = HashSet::new();
     let mut github_in_flight: HashSet<String> = HashSet::new();
@@ -134,8 +136,9 @@ fn select_from_list(
     let mut tag_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut tag_in_flight: HashSet<String> = HashSet::new();
     let mut tag_scan_started = false;
-    let mut filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
+    let mut filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
     let mut preview_path: Option<String> = None;
+    let mut preview_entry_id: Option<String> = None;
     let mut in_flight: Option<String> = None;
     let mut compositor = CurrentCompositor::new(build_placeholder_text(
         None,
@@ -149,11 +152,51 @@ fn select_from_list(
     let mut tag_edit_tags: Vec<String> = Vec::new();
     let mut tag_input = Input::default();
     let mut tag_suggestions: Vec<String> = Vec::new();
+    spawn_worktree_result_provider(&entries, result_tx);
 
     loop {
-        let current = current_selection_path(items, &filtered, selected);
+        let current_entry = current_selection_entry(&entries, &filtered, selected).cloned();
+        let current = current_entry
+            .as_ref()
+            .map(|entry| entry.preview_root_path.clone());
         let query_value = input.value();
         let tokens = parse_query_tokens(query_value);
+
+        let mut entries_changed = false;
+        while let Ok(update) = result_rx.try_recv() {
+            match update {
+                ResultUpdate::Entries { entries: incoming } => {
+                    for entry in incoming {
+                        if entries.iter().any(|candidate| candidate.id == entry.id) {
+                            continue;
+                        }
+                        entries.push(entry);
+                        entries_changed = true;
+                    }
+                }
+                ResultUpdate::ReplaceProviderEntries {
+                    provider_prefix,
+                    entries: replacement,
+                } => {
+                    entries.retain(|entry| !entry.id.starts_with(&provider_prefix));
+                    entries.extend(replacement);
+                    entries_changed = true;
+                }
+                ResultUpdate::Status {
+                    provider_id: _,
+                    message: _,
+                } => {}
+            }
+        }
+
+        if entries_changed {
+            let selected_id = current_entry.as_ref().map(|entry| entry.id.clone());
+            filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+            selected = selected_id
+                .as_deref()
+                .and_then(|id| index_for_entry_id(&entries, &filtered, id))
+                .unwrap_or_else(|| adjust_selected_index(selected, filtered.len()));
+        }
 
         while let Ok(result) = preview_rx.try_recv() {
             preview_cache.insert(result.path.clone(), result.data.clone());
@@ -184,8 +227,9 @@ fn select_from_list(
                 );
             }
             if current.as_deref() == Some(result.path.as_str()) {
-                compositor.apply_preview(&result.data);
+                apply_preview_for_entry(&mut compositor, &result.data, current_entry.as_ref());
                 preview_path = Some(result.path.clone());
+                preview_entry_id = current_entry.as_ref().map(|entry| entry.id.clone());
             }
             if in_flight.as_deref() == Some(result.path.as_str()) {
                 in_flight = None;
@@ -203,7 +247,7 @@ fn select_from_list(
             }
             if updated && current.as_deref() == Some(result.path.as_str()) {
                 if let Some(data) = preview_cache.get(&result.path) {
-                    compositor.apply_preview(data);
+                    apply_preview_for_entry(&mut compositor, data, current_entry.as_ref());
                 }
             }
         }
@@ -219,7 +263,7 @@ fn select_from_list(
             }
             if updated && current.as_deref() == Some(result.path.as_str()) {
                 if let Some(data) = preview_cache.get(&result.path) {
-                    compositor.apply_preview(data);
+                    apply_preview_for_entry(&mut compositor, data, current_entry.as_ref());
                 }
             }
         }
@@ -252,24 +296,27 @@ fn select_from_list(
 
         let query_uses_tags = tokens.needs_tags();
         if query_uses_tags && !tag_scan_started {
-            spawn_bulk_tag_fetch(items, &tag_cache, &mut tag_in_flight, &tag_tx);
+            let paths = all_metadata_paths(&entries);
+            spawn_bulk_tag_fetch(&paths, &tag_cache, &mut tag_in_flight, &tag_tx);
             tag_scan_started = true;
         }
 
         if resort_needed {
-            let selected_path = current_selection_path(items, &filtered, selected);
-            filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
-            selected = match selected_path {
-                Some(path) => index_for_path(items, &filtered, &path).unwrap_or(0),
+            let selected_id = current_selection_entry(&entries, &filtered, selected)
+                .map(|entry| entry.id.clone());
+            filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+            selected = match selected_id {
+                Some(id) => index_for_entry_id(&entries, &filtered, &id).unwrap_or(0),
                 None => adjust_selected_index(selected, filtered.len()),
             };
         }
 
         if tags_changed && query_uses_tags {
-            let selected_path = current_selection_path(items, &filtered, selected);
-            filtered = filter_and_sort(items, input.value(), sort_mode, &meta_cache, &tag_cache);
-            selected = match selected_path {
-                Some(path) => index_for_path(items, &filtered, &path).unwrap_or(0),
+            let selected_id = current_selection_entry(&entries, &filtered, selected)
+                .map(|entry| entry.id.clone());
+            filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+            selected = match selected_id {
+                Some(id) => index_for_entry_id(&entries, &filtered, &id).unwrap_or(0),
                 None => adjust_selected_index(selected, filtered.len()),
             };
         }
@@ -281,15 +328,20 @@ fn select_from_list(
                         build_placeholder_text(None, accent, muted, text, "No selection");
                     compositor.reset_for_no_selection(placeholder);
                     preview_path = None;
+                    preview_entry_id = None;
                     in_flight = None;
                 }
             }
             Some(path) => {
-                if preview_path.as_deref() != Some(path) {
+                let current_entry_id = current_entry.as_ref().map(|entry| entry.id.as_str());
+                if preview_path.as_deref() != Some(path)
+                    || preview_entry_id.as_deref() != current_entry_id
+                {
                     compositor.reset_for_new_selection();
                     if let Some(data) = preview_cache.get(path) {
-                        compositor.apply_preview(data);
+                        apply_preview_for_entry(&mut compositor, data, current_entry.as_ref());
                         preview_path = Some(path.to_string());
+                        preview_entry_id = current_entry.as_ref().map(|entry| entry.id.clone());
                         ensure_git_for_preview(
                             path,
                             data,
@@ -324,6 +376,7 @@ fn select_from_list(
                         );
                         compositor.set_loading(placeholder);
                         preview_path = Some(path.to_string());
+                        preview_entry_id = current_entry.as_ref().map(|entry| entry.id.clone());
                         in_flight = Some(path.to_string());
                         let tx = preview_tx.clone();
                         let path_owned = path.to_string();
@@ -358,7 +411,7 @@ fn select_from_list(
             let list_area = ui.list_area;
             let detail_area = ui.detail_area;
 
-            let list_title = format!("Results {}/{}", filtered.len(), items.len());
+            let list_title = format!("Results {}/{}", filtered.len(), entries.len());
             let left_title = if focus == Focus::Search {
                 format!("* {}", list_title)
             } else {
@@ -403,12 +456,12 @@ fn select_from_list(
             let scrollbar_space = if total > 0 { 1 } else { 0 };
             let list_inner_width = results_area.width.saturating_sub(scrollbar_space) as usize;
             let visible_paths =
-                visible_paths_for_window(items, &filtered, list_offset, list_inner_height);
+                visible_paths_for_window(&entries, &filtered, list_offset, list_inner_height);
             ensure_dates_for_paths(&visible_paths, &date_cache, &mut date_in_flight, &date_tx);
             ensure_tags_for_paths(&visible_paths, &tag_cache, &mut tag_in_flight, &tag_tx);
 
             let (list_items, list_selected) = build_visible_list_items(VisibleListArgs {
-                items,
+                entries: &entries,
                 filtered: &filtered,
                 selected,
                 offset: list_offset,
@@ -583,7 +636,7 @@ fn select_from_list(
                             current.as_deref(),
                             compositor.active_content_index(),
                             &preview_cache,
-                            current_selection_path(items, &filtered, selected).as_deref(),
+                            current_selection_entry(&entries, &filtered, selected),
                         ) {
                             let _ = copy_to_clipboard(&value);
                         }
@@ -593,7 +646,9 @@ fn select_from_list(
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && focus != Focus::TagEdit
                     {
-                        if let Some(path) = current_selection_path(items, &filtered, selected) {
+                        if let Some(path) = current_selection_entry(&entries, &filtered, selected)
+                            .map(|entry| entry.metadata_path.clone())
+                        {
                             tag_edit_path = Some(path.clone());
                             tag_edit_tags = read_tags_for_path(&path);
                             tag_input.reset();
@@ -609,7 +664,7 @@ fn select_from_list(
                             current.as_deref(),
                             compositor.active_content_index(),
                             &preview_cache,
-                            current_selection_path(items, &filtered, selected).as_deref(),
+                            current_selection_entry(&entries, &filtered, selected),
                         );
                         if let Some(value) = value {
                             terminal.show_cursor()?;
@@ -621,7 +676,7 @@ fn select_from_list(
                     {
                         sort_mode = sort_mode.next();
                         filtered = filter_and_sort(
-                            items,
+                            &entries,
                             input.value(),
                             sort_mode,
                             &meta_cache,
@@ -630,15 +685,17 @@ fn select_from_list(
                         selected = 0;
                         list_offset = 0;
                         if sort_mode.uses_time() {
+                            let paths = all_metadata_paths(&entries);
                             spawn_bulk_metadata_fetch(
-                                items,
+                                &paths,
                                 &date_cache,
                                 &mut date_in_flight,
                                 &date_tx,
                             );
                         }
                         if parse_query_tokens(input.value()).needs_tags() && !tag_scan_started {
-                            spawn_bulk_tag_fetch(items, &tag_cache, &mut tag_in_flight, &tag_tx);
+                            let paths = all_metadata_paths(&entries);
+                            spawn_bulk_tag_fetch(&paths, &tag_cache, &mut tag_in_flight, &tag_tx);
                             tag_scan_started = true;
                         }
                         continue;
@@ -678,7 +735,7 @@ fn select_from_list(
                                 }
                                 if input.value() != before {
                                     filtered = filter_and_sort(
-                                        items,
+                                        &entries,
                                         input.value(),
                                         sort_mode,
                                         &meta_cache,
@@ -704,18 +761,19 @@ fn select_from_list(
                                 tag_edit_path = None;
                                 tag_edit_tags.clear();
                                 tag_input.reset();
-                                let selected_path =
-                                    current_selection_path(items, &filtered, selected);
+                                let selected_id =
+                                    current_selection_entry(&entries, &filtered, selected)
+                                        .map(|entry| entry.id.clone());
                                 filtered = filter_and_sort(
-                                    items,
+                                    &entries,
                                     input.value(),
                                     sort_mode,
                                     &meta_cache,
                                     &tag_cache,
                                 );
-                                selected = match selected_path {
+                                selected = match selected_id {
                                     Some(value) => {
-                                        index_for_path(items, &filtered, &value).unwrap_or(0)
+                                        index_for_entry_id(&entries, &filtered, &value).unwrap_or(0)
                                     }
                                     None => adjust_selected_index(selected, filtered.len()),
                                 };
@@ -755,7 +813,7 @@ fn select_from_list(
                     Focus::Search => {
                         insert_paste(&mut input, &value);
                         filtered = filter_and_sort(
-                            items,
+                            &entries,
                             input.value(),
                             sort_mode,
                             &meta_cache,
@@ -836,6 +894,17 @@ fn insert_paste(input: &mut Input, value: &str) {
     }
 }
 
+fn apply_preview_for_entry(
+    compositor: &mut CurrentCompositor,
+    data: &PreviewData,
+    entry: Option<&NavigateEntry>,
+) {
+    compositor.apply_preview(data);
+    if let Some(preferred_path) = entry.and_then(|entry| entry.preferred_preview_path.as_deref()) {
+        compositor.select_preview_path(data, preferred_path);
+    }
+}
+
 fn focus_from_change(change: FocusChange) -> Focus {
     match change {
         FocusChange::Search => Focus::Search,
@@ -868,11 +937,12 @@ fn compute_list_window_offset(
     offset
 }
 
-fn current_selection_path(items: &[String], filtered: &[usize], selected: usize) -> Option<String> {
-    filtered
-        .get(selected)
-        .and_then(|index| items.get(*index))
-        .cloned()
+fn current_selection_entry<'a>(
+    entries: &'a [NavigateEntry],
+    filtered: &[usize],
+    selected: usize,
+) -> Option<&'a NavigateEntry> {
+    filtered.get(selected).and_then(|index| entries.get(*index))
 }
 
 fn enter_selection_path(
@@ -896,20 +966,20 @@ fn selection_path_for_action(
     current_path: Option<&str>,
     preview_tab_index: usize,
     preview_cache: &HashMap<String, PreviewData>,
-    selected_path: Option<&str>,
+    selected_entry: Option<&NavigateEntry>,
 ) -> Option<String> {
     enter_selection_path(focus, current_path, preview_tab_index, preview_cache).or_else(|| {
-        let selected_path = selected_path?;
+        let selected_entry = selected_entry?;
         preview_cache
-            .get(selected_path)
+            .get(&selected_entry.preview_root_path)
             .and_then(|data| data.previews.first())
             .map(|tab| tab.path.clone())
-            .or_else(|| Some(selected_path.to_string()))
+            .or_else(|| Some(selected_entry.selection_path.clone()))
     })
 }
 
 fn visible_paths_for_window(
-    items: &[String],
+    entries: &[NavigateEntry],
     filtered: &[usize],
     offset: usize,
     height: usize,
@@ -920,9 +990,20 @@ fn visible_paths_for_window(
     let end = (offset + height).min(filtered.len());
     filtered[offset..end]
         .iter()
-        .filter_map(|index| items.get(*index))
-        .cloned()
+        .filter_map(|index| entries.get(*index))
+        .map(|entry| entry.metadata_path.clone())
         .collect()
+}
+
+fn all_metadata_paths(entries: &[NavigateEntry]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for entry in entries {
+        if seen.insert(entry.metadata_path.clone()) {
+            paths.push(entry.metadata_path.clone());
+        }
+    }
+    paths
 }
 
 struct TerminalGuard;
@@ -1084,13 +1165,14 @@ mod tests {
         assert!(
             enter_selection_path(Focus::Search, Some("/repos/project.git"), 1, &cache).is_none()
         );
+        let selected_entry = test_entry("project", "project.git", "/repos/project.git");
         assert_eq!(
             selection_path_for_action(
                 Focus::Search,
                 Some("/repos/project.git"),
                 1,
                 &cache,
-                Some("/repos/project.git"),
+                Some(&selected_entry),
             )
             .as_deref(),
             Some("/repos/project")
@@ -1190,26 +1272,104 @@ mod tests {
     }
 
     #[test]
-    fn visible_name_match_ranks_before_deep_parent_path_match() {
-        let items = vec![
-            "/repos/Trading Platform Location/Funnel Not Working".to_string(),
-            "/repos/Trading Platform Location".to_string(),
+    fn visible_name_match_does_not_include_deep_parent_path_match() {
+        let entries = vec![
+            test_entry(
+                "child",
+                "Funnel Not Working",
+                "/repos/Trading Platform Location/Funnel Not Working",
+            ),
+            test_entry(
+                "parent",
+                "Trading Platform Location",
+                "/repos/Trading Platform Location",
+            ),
         ];
         let filtered = search::filter_and_sort(
-            &items,
+            &entries,
             "trading platform location",
             SortMode::Match,
             &HashMap::new(),
             &HashMap::new(),
         );
 
-        assert_eq!(filtered, vec![1, 0]);
+        assert_eq!(filtered, vec![1]);
 
         let tokens = search::parse_query_tokens("trading platform location");
         assert_eq!(
-            search::match_context(&items[0], &[], &tokens).as_deref(),
-            Some("in Trading Platform Location")
+            search::entry_match_context(&entries[0], &[], &tokens).as_deref(),
+            None
         );
+    }
+
+    #[test]
+    fn entry_match_context_explains_hidden_search_field_match() {
+        let entry = model::NavigateEntry {
+            id: "hidden".to_string(),
+            display: "dev-on-tuesday-github-org-portal-ui".to_string(),
+            context: None,
+            preview_root_path: "/repos/ideda/dev-on-tuesday-github-org-portal-ui".to_string(),
+            preferred_preview_path: None,
+            selection_path: "/repos/ideda/dev-on-tuesday-github-org-portal-ui".to_string(),
+            metadata_path: "/repos/ideda/dev-on-tuesday-github-org-portal-ui".to_string(),
+            search_text: vec![
+                "dev-on-tuesday-github-org-portal-ui".to_string(),
+                "/repos/ideda/dev-on-tuesday-github-org-portal-ui".to_string(),
+            ],
+            kind: model::NavigateEntryKind::Project,
+        };
+        let tokens = search::parse_query_tokens("ideda");
+
+        assert_eq!(
+            search::entry_match_context(&entry, &[], &tokens).as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn compositor_selects_preferred_worktree_preview_tab() {
+        let data = PreviewData {
+            previews: vec![
+                model::PreviewTab {
+                    path: "/repos/project".to_string(),
+                    label: "main".to_string(),
+                    text: Text::from(Line::from("main")),
+                    git: None,
+                    github_readme: None,
+                },
+                model::PreviewTab {
+                    path: "/repos/project-QCDI-8206".to_string(),
+                    label: "QCDI-8206".to_string(),
+                    text: Text::from(Line::from("worktree")),
+                    git: None,
+                    github_readme: None,
+                },
+            ],
+            selected_repo_is_bare: false,
+            git_loaded: false,
+            github_readme_loaded: false,
+        };
+        let mut compositor = CurrentCompositor::new(Text::default());
+
+        compositor.apply_preview(&data);
+        compositor.select_preview_path(&data, "/repos/project-QCDI-8206");
+
+        assert_eq!(compositor.active_content_index(), 1);
+        assert_eq!(compositor.preview_tab_visible_index, 1);
+    }
+
+    fn test_entry(id: &str, display: &str, path: &str) -> model::NavigateEntry {
+        model::NavigateEntry {
+            id: id.to_string(),
+            display: display.to_string(),
+            context: None,
+            preview_root_path: path.to_string(),
+            preferred_preview_path: None,
+            selection_path: path.to_string(),
+            metadata_path: path.to_string(),
+            search_text: vec![display.to_string()],
+            kind: model::NavigateEntryKind::Project,
+        }
     }
 
     #[test]
