@@ -10,6 +10,30 @@ Rust TUI tools for project navigation and GitHub issue exploration. Shared gener
 cargo build --release --workspace
 ```
 
+## Homebrew
+
+Install the latest stable release from the Yarden tap:
+
+```
+brew install yarden-zamir/tap/navgator
+```
+
+Install the current `main` branch directly:
+
+```
+brew install --HEAD yarden-zamir/tap/navgator
+```
+
+The formula installs `navgator-navigate`, `navgator-issues`, and a `navgator` alias for `navgator-navigate`.
+
+## Release
+
+Every push to `main` runs `.github/workflows/ci.yml`. The workflow checks formatting, runs the workspace tests, creates the next semver tag, creates a GitHub release, and opens a Homebrew formula bump PR in `Yarden-zamir/homebrew-tap`.
+
+The Homebrew tap auto-merges bump PRs that contain `/auto-merge` after tap checks pass, so a successful `main` push publishes the next `brew install yarden-zamir/tap/navgator` version automatically.
+
+The release workflow requires the repository secret `TOKEN` with permission to push tags, create releases, and open PRs against `Yarden-zamir/homebrew-tap`.
+
 ## Run
 
 ```
