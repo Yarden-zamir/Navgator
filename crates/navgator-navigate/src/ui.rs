@@ -1,7 +1,7 @@
 use crate::metadata::format_date_display;
 use crate::model::{
-    Focus, HelpColors, HelpContext, PreviewSettings, SidePanelRender, UiLayout, VisibleListArgs,
-    DATE_PLACEHOLDER, MIN_PARTIAL_TAB_WIDTH, TAB_DIVIDER_WIDTH,
+    Focus, HelpColors, HelpContext, PreviewSettings, RemoteToggleState, SidePanelRender, UiLayout,
+    VisibleListArgs, DATE_PLACEHOLDER, MIN_PARTIAL_TAB_WIDTH, TAB_DIVIDER_WIDTH,
 };
 use crate::search::{entry_match_context, fuzzy_match, QueryTokens};
 use ratatui::{
@@ -20,6 +20,7 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
         .fg(colors.accent)
         .add_modifier(Modifier::BOLD);
     let regular_style = Style::default().fg(colors.text);
+    let (remote_label, remote_style) = remote_toggle_help(context.remote_state, colors);
     let mut spans: Vec<Span> = Vec::new();
     let has_prev_preview = context.preview_tab_index > 0;
     let has_next_preview = context.preview_tab_index + 1 < context.preview_tab_count;
@@ -44,7 +45,13 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             spans.push(Span::styled("Ctrl+U", key_style));
             spans.push(Span::styled(" clear  ", regular_style));
             spans.push(Span::styled("Ctrl+Y", key_style));
-            spans.push(Span::styled(" copy", regular_style));
+            spans.push(Span::styled(" copy  ", regular_style));
+            if context.can_delete_worktree {
+                spans.push(Span::styled("Ctrl+D", key_style));
+                spans.push(Span::styled(" delete  ", regular_style));
+            }
+            spans.push(Span::styled("Ctrl+O", remote_style));
+            spans.push(Span::styled(format!(" {remote_label}"), remote_style));
         }
         Focus::Preview => {
             let label = if context.preview_tab_count > 1 {
@@ -75,6 +82,12 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             spans.push(Span::styled(" tag  ", regular_style));
             spans.push(Span::styled("Ctrl+Y", key_style));
             spans.push(Span::styled(" copy  ", regular_style));
+            if context.can_delete_worktree {
+                spans.push(Span::styled("Ctrl+D", key_style));
+                spans.push(Span::styled(" delete  ", regular_style));
+            }
+            spans.push(Span::styled("Ctrl+O", remote_style));
+            spans.push(Span::styled(format!(" {remote_label}  "), remote_style));
             if context.preview_scroll == 0 && !has_prev_preview {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" search  ", regular_style));
@@ -115,6 +128,12 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
             spans.push(Span::styled(" tag  ", regular_style));
             spans.push(Span::styled("Ctrl+Y", key_style));
             spans.push(Span::styled(" copy  ", regular_style));
+            if context.can_delete_worktree {
+                spans.push(Span::styled("Ctrl+D", key_style));
+                spans.push(Span::styled(" delete  ", regular_style));
+            }
+            spans.push(Span::styled("Ctrl+O", remote_style));
+            spans.push(Span::styled(format!(" {remote_label}  "), remote_style));
             if context.detail_scroll == 0 {
                 spans.push(Span::styled("Up", key_style));
                 spans.push(Span::styled(" preview", regular_style));
@@ -135,6 +154,35 @@ pub(crate) fn build_help_line(context: HelpContext, colors: HelpColors) -> Line<
     }
 
     Line::from(spans)
+}
+
+fn remote_toggle_help(state: RemoteToggleState, colors: HelpColors) -> (&'static str, Style) {
+    match state {
+        RemoteToggleState::Off => (
+            "remote",
+            Style::default()
+                .fg(colors.key_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RemoteToggleState::Fetching => (
+            "refreshing",
+            Style::default()
+                .fg(colors.remote_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RemoteToggleState::Active => (
+            "remote:on",
+            Style::default()
+                .fg(colors.remote_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RemoteToggleState::Error => (
+            "remote:error",
+            Style::default()
+                .fg(colors.remote_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    }
 }
 
 pub(crate) fn compute_ui_layout(size: Rect, show_detail: bool) -> UiLayout {

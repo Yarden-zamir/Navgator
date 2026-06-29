@@ -1,5 +1,9 @@
 use crate::config::load_config;
-use crate::git::{git_worktree_label, git_worktrees_for_path};
+use crate::git::{
+    dot_bare_for_path, git_worktree_label, git_worktrees_for_path, local_branch_for_remote,
+    local_remote_branches_for_bare, ls_remote_heads, remote_branch_summaries_for_bare,
+    remote_branch_target_paths, RemoteBranchSummary,
+};
 use crate::model::{
     AppResult, BuildItemsResult, GitWorktree, NavigateEntry, NavigateEntryKind, ResultUpdate,
 };
@@ -9,7 +13,7 @@ use crate::provider_runtime::{
 use crate::search::entry_name;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::mpsc,
@@ -18,8 +22,11 @@ use std::{
 };
 
 const WORKTREE_PROVIDER_PREFIX: &str = "worktree:";
+pub(crate) const REMOTE_BRANCH_PROVIDER_PREFIX: &str = "remote-branch:";
 const WORKTREE_CACHE_FILE: &str = "worktrees.json";
 const WORKTREE_CACHE_VERSION: u32 = 2;
+const REMOTE_BRANCH_CACHE_FILE: &str = "remote-branches.json";
+const REMOTE_BRANCH_CACHE_VERSION: u32 = 1;
 const BRANCH_ICON: &str = "";
 
 pub(crate) trait ResultProvider {
@@ -40,6 +47,19 @@ struct WorktreeCache {
     version: u32,
     generated_at: u64,
     entries: Vec<NavigateEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RemoteBranchCache {
+    version: u32,
+    generated_at: u64,
+    repos: Vec<RemoteBranchCacheRepo>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RemoteBranchCacheRepo {
+    bare_path: String,
+    branches: Vec<String>,
 }
 
 pub(crate) fn build_items() -> AppResult<BuildItemsResult> {
@@ -65,6 +85,161 @@ pub(crate) fn spawn_worktree_result_provider(
         project_entries: project_entries.to_vec(),
     };
     provider.spawn_updates(tx);
+}
+
+pub(crate) fn spawn_remote_branch_result_provider(
+    entry: NavigateEntry,
+    tx: mpsc::Sender<ResultUpdate>,
+) {
+    thread::spawn(move || {
+        let Some((bare, container)) = dot_bare_for_path(Path::new(&entry.selection_path)) else {
+            let _ = tx.send(ResultUpdate::Status {
+                provider_id: REMOTE_BRANCH_PROVIDER_PREFIX.to_string(),
+                message: "This repo must be migrated to a bare repo first.".to_string(),
+            });
+            let _ = tx.send(ResultUpdate::ReplaceProviderEntries {
+                provider_prefix: REMOTE_BRANCH_PROVIDER_PREFIX.to_string(),
+                entries: Vec::new(),
+            });
+            return;
+        };
+
+        let repo_label = entry_name(&container.to_string_lossy());
+        let summaries = remote_branch_summaries_for_bare(&bare);
+        send_remote_entries_if_any(
+            &tx,
+            remote_branch_entries_for_branches(
+                &repo_label,
+                &bare,
+                &container,
+                load_remote_branch_cache_for_bare(&bare),
+                &summaries,
+            ),
+        );
+
+        send_remote_entries_if_any(
+            &tx,
+            remote_branch_entries_for_branches(
+                &repo_label,
+                &bare,
+                &container,
+                local_remote_branches_for_bare(&bare),
+                &summaries,
+            ),
+        );
+        send_remote_status(&tx, format!("refreshing {repo_label}..."));
+        let remote_branches = match ls_remote_heads(&bare) {
+            Ok(branches) => branches,
+            Err(message) => {
+                send_remote_status(&tx, message);
+                return;
+            }
+        };
+
+        let _ = save_remote_branch_cache_for_bare(&bare, &remote_branches);
+        replace_remote_entries(
+            &tx,
+            remote_branch_entries_for_branches(
+                &repo_label,
+                &bare,
+                &container,
+                remote_branches,
+                &summaries,
+            ),
+        );
+        send_remote_status(&tx, "remote branches loaded".to_string());
+    });
+}
+
+fn send_remote_entries_if_any(tx: &mpsc::Sender<ResultUpdate>, entries: Vec<NavigateEntry>) {
+    if !entries.is_empty() {
+        replace_remote_entries(tx, entries);
+    }
+}
+
+fn replace_remote_entries(tx: &mpsc::Sender<ResultUpdate>, entries: Vec<NavigateEntry>) {
+    let _ = tx.send(ResultUpdate::ReplaceProviderEntries {
+        provider_prefix: REMOTE_BRANCH_PROVIDER_PREFIX.to_string(),
+        entries,
+    });
+}
+
+fn send_remote_status(tx: &mpsc::Sender<ResultUpdate>, message: String) {
+    let _ = tx.send(ResultUpdate::Status {
+        provider_id: REMOTE_BRANCH_PROVIDER_PREFIX.to_string(),
+        message,
+    });
+}
+
+fn remote_branch_entries_for_branches(
+    repo_label: &str,
+    bare: &Path,
+    container: &Path,
+    remote_branches: Vec<String>,
+    summaries: &HashMap<String, RemoteBranchSummary>,
+) -> Vec<NavigateEntry> {
+    let existing_branches = git_worktrees_for_path(bare)
+        .into_iter()
+        .filter_map(|worktree| worktree.branch)
+        .collect::<HashSet<String>>();
+    let mut entries = Vec::new();
+    let mut seen_entries = HashSet::new();
+    let target_paths = remote_branch_target_paths(bare, container, &remote_branches);
+    let bare_path = bare.to_string_lossy();
+    let container_path = container.to_string_lossy();
+    for remote_branch in remote_branches {
+        let branch = local_branch_for_remote(&remote_branch);
+        if existing_branches.contains(&branch) {
+            continue;
+        }
+        let Some(target_path) = target_paths.get(&remote_branch) else {
+            continue;
+        };
+        let remote_entry = remote_branch_entry(
+            repo_label,
+            bare_path.as_ref(),
+            container_path.as_ref(),
+            &remote_branch,
+            target_path.to_string_lossy().to_string(),
+            summaries.get(&remote_branch),
+        );
+        if seen_entries.insert(remote_entry.id.clone()) {
+            entries.push(remote_entry);
+        }
+    }
+    entries
+}
+
+fn load_remote_branch_cache_for_bare(bare: &Path) -> Vec<String> {
+    let bare_path = bare.to_string_lossy();
+    load_json_cache::<RemoteBranchCache>(REMOTE_BRANCH_CACHE_FILE)
+        .filter(|cache| cache.version == REMOTE_BRANCH_CACHE_VERSION)
+        .and_then(|cache| {
+            cache
+                .repos
+                .into_iter()
+                .find(|repo| repo.bare_path == bare_path)
+                .map(|repo| repo.branches)
+        })
+        .unwrap_or_default()
+}
+
+fn save_remote_branch_cache_for_bare(bare: &Path, branches: &[String]) -> std::io::Result<()> {
+    let bare_path = bare.to_string_lossy().to_string();
+    let mut cache = load_json_cache::<RemoteBranchCache>(REMOTE_BRANCH_CACHE_FILE)
+        .filter(|cache| cache.version == REMOTE_BRANCH_CACHE_VERSION)
+        .unwrap_or_else(|| RemoteBranchCache {
+            version: REMOTE_BRANCH_CACHE_VERSION,
+            generated_at: unix_timestamp(),
+            repos: Vec::new(),
+        });
+    cache.generated_at = unix_timestamp();
+    cache.repos.retain(|repo| repo.bare_path != bare_path);
+    cache.repos.push(RemoteBranchCacheRepo {
+        bare_path,
+        branches: branches.to_vec(),
+    });
+    save_json_cache(REMOTE_BRANCH_CACHE_FILE, &cache)
 }
 
 impl ProjectResultProvider {
@@ -243,6 +418,75 @@ fn worktree_entry(repo_entry: &NavigateEntry, worktree: &GitWorktree) -> Navigat
     }
 }
 
+fn remote_branch_entry(
+    repo_label: &str,
+    bare_path: &str,
+    container_path: &str,
+    remote_branch: &str,
+    target_path: String,
+    summary: Option<&RemoteBranchSummary>,
+) -> NavigateEntry {
+    let branch = local_branch_for_remote(remote_branch);
+    let display = format!("{BRANCH_ICON} {repo_label} {remote_branch}");
+    let context = remote_branch_context(summary);
+    NavigateEntry {
+        id: format!("{REMOTE_BRANCH_PROVIDER_PREFIX}{bare_path}:{remote_branch}"),
+        display: display.clone(),
+        context: Some(context.clone()),
+        preview_root_path: format!("remote:{bare_path}:{remote_branch}"),
+        preferred_preview_path: None,
+        selection_path: target_path.clone(),
+        metadata_path: target_path,
+        search_text: vec![display, context],
+        kind: NavigateEntryKind::RemoteBranch {
+            repo_label: repo_label.to_string(),
+            branch,
+            remote_branch: remote_branch.to_string(),
+            bare_path: bare_path.to_string(),
+            container_path: container_path.to_string(),
+        },
+    }
+}
+
+fn remote_branch_context(summary: Option<&RemoteBranchSummary>) -> String {
+    let Some(summary) = summary else {
+        return "remote".to_string();
+    };
+    let age = short_relative_age(&summary.age);
+    match (summary.age.is_empty(), summary.author.is_empty()) {
+        (false, false) => format!("{age} - {}", summary.author),
+        (false, true) => age,
+        (true, false) => summary.author.clone(),
+        (true, true) => "remote".to_string(),
+    }
+}
+
+fn short_relative_age(age: &str) -> String {
+    let trimmed = age.trim();
+    if trimmed.eq_ignore_ascii_case("now") || trimmed.eq_ignore_ascii_case("just now") {
+        return "now".to_string();
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let Some(value) = parts.next() else {
+        return trimmed.to_string();
+    };
+    let Some(unit) = parts.next() else {
+        return trimmed.to_string();
+    };
+    let suffix = match unit.trim_end_matches('s') {
+        "second" => "s",
+        "minute" => "m",
+        "hour" => "h",
+        "day" => "d",
+        "week" => "w",
+        "month" => "mo",
+        "year" => "y",
+        _ => return trimmed.to_string(),
+    };
+    format!("{value}{suffix}")
+}
+
 fn is_dir(path: &Path) -> bool {
     fs::metadata(path)
         .map(|meta| meta.is_dir())
@@ -251,7 +495,9 @@ fn is_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{project_entry, worktree_entry, WorktreeCache, WORKTREE_CACHE_VERSION};
+    use super::{
+        project_entry, short_relative_age, worktree_entry, WorktreeCache, WORKTREE_CACHE_VERSION,
+    };
     use crate::model::GitWorktree;
 
     #[test]
@@ -301,5 +547,13 @@ mod tests {
         assert_eq!(restored.version, WORKTREE_CACHE_VERSION);
         assert_eq!(restored.entries[0].display, " app QCDI-8206");
         assert_eq!(restored.entries[0].selection_path, "/repos/app-QCDI-8206");
+    }
+
+    #[test]
+    fn shortens_relative_ages() {
+        assert_eq!(short_relative_age("12 minutes ago"), "12m");
+        assert_eq!(short_relative_age("3 hours ago"), "3h");
+        assert_eq!(short_relative_age("1 month ago"), "1mo");
+        assert_eq!(short_relative_age("just now"), "now");
     }
 }

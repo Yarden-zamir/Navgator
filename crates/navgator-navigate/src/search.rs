@@ -86,6 +86,14 @@ pub(crate) fn entry_match_context(
         if fuzzy_match(token, &entry.display) {
             continue;
         }
+        if let Some(context) = entry
+            .context
+            .as_ref()
+            .filter(|context| fuzzy_match(token, context))
+        {
+            contexts.push(context.clone());
+            continue;
+        }
     }
     for token in &tokens.tags {
         if let Some(tag) = tags.iter().find(|tag| fuzzy_match(token, tag)) {
@@ -175,7 +183,7 @@ fn matches_entry_tokens(entry: &NavigateEntry, tags: &[String], tokens: &QueryTo
 }
 
 fn matches_entry_text_token(token: &str, entry: &NavigateEntry) -> bool {
-    fuzzy_match(token, &entry.display)
+    searchable_text(entry).any(|text| fuzzy_match(token, text))
 }
 
 fn match_score_entry_tokens(
@@ -218,7 +226,17 @@ fn match_score_entry_tokens(
 }
 
 fn match_score_for_entry(token: &str, entry: &NavigateEntry) -> Option<MatchScore> {
-    match_score(token, &entry.display)
+    searchable_text(entry)
+        .filter_map(|text| match_score(token, text))
+        .min()
+}
+
+fn searchable_text(entry: &NavigateEntry) -> impl Iterator<Item = &str> {
+    entry
+        .search_text
+        .iter()
+        .map(String::as_str)
+        .chain(entry.context.as_deref())
 }
 
 fn best_tag_score(token: &str, tags: &[String]) -> Option<MatchScore> {
@@ -402,4 +420,46 @@ fn char_index_from_byte(text: &str, byte_index: usize) -> usize {
     text.char_indices()
         .take_while(|(idx, _)| *idx < byte_index)
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_and_sort;
+    use crate::model::{NavigateEntry, NavigateEntryKind, SortMode};
+    use std::collections::HashMap;
+
+    #[test]
+    fn searches_visible_context_text() {
+        let entry = NavigateEntry {
+            id: "remote".to_string(),
+            display: " repo origin/feature".to_string(),
+            context: Some("12m - Alice".to_string()),
+            preview_root_path: "remote:/repo.git:origin/feature".to_string(),
+            preferred_preview_path: None,
+            selection_path: "/repo-feature".to_string(),
+            metadata_path: "/repo-feature".to_string(),
+            search_text: vec![
+                " repo origin/feature".to_string(),
+                "12m - Alice".to_string(),
+            ],
+            kind: NavigateEntryKind::RemoteBranch {
+                repo_label: "repo".to_string(),
+                branch: "feature".to_string(),
+                remote_branch: "origin/feature".to_string(),
+                bare_path: "/repo.git".to_string(),
+                container_path: "/".to_string(),
+            },
+        };
+
+        assert_eq!(
+            filter_and_sort(
+                &[entry],
+                "Alice",
+                SortMode::Match,
+                &HashMap::new(),
+                &HashMap::new()
+            ),
+            vec![0]
+        );
+    }
 }

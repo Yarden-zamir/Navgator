@@ -1,9 +1,10 @@
-use crate::commands::run_command_output;
 use crate::model::{MetaResult, DATE_WIDTH};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     sync::mpsc,
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) fn ensure_dates_for_paths(
@@ -63,26 +64,16 @@ pub(crate) fn format_date_display(value: &str) -> String {
 }
 
 fn fetch_metadata(path: &str) -> MetaResult {
-    let args = vec![
-        "-f".to_string(),
-        "%m %B %Sm".to_string(),
-        "-t".to_string(),
-        "%Y-%m-%d %H:%M".to_string(),
-        path.to_string(),
-    ];
-    let output = run_command_output("stat", &args, None);
-    let mut display = None;
-    let mut modified_epoch = None;
-    let mut created_epoch = None;
-
-    if let Some(out) = output {
-        let parts: Vec<&str> = out.split_whitespace().collect();
-        if parts.len() >= 3 {
-            modified_epoch = parse_epoch(parts[0]);
-            created_epoch = parse_epoch(parts[1]);
-            display = Some(parts[2..].join(" "));
-        }
-    }
+    let metadata = fs::metadata(path).ok();
+    let modified_epoch = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_epoch);
+    let created_epoch = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(system_time_epoch);
+    let display = modified_epoch.map(format_epoch_minutes);
 
     MetaResult {
         path: path.to_string(),
@@ -92,11 +83,28 @@ fn fetch_metadata(path: &str) -> MetaResult {
     }
 }
 
-fn parse_epoch(value: &str) -> Option<i64> {
-    let parsed = value.trim().parse::<i64>().ok()?;
-    if parsed <= 0 {
-        None
-    } else {
-        Some(parsed)
+fn system_time_epoch(value: SystemTime) -> Option<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64)
+        .filter(|value| *value > 0)
+}
+
+fn format_epoch_minutes(epoch: i64) -> String {
+    let timestamp = epoch as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let local_time = unsafe { libc::localtime_r(&timestamp, tm.as_mut_ptr()) };
+    if local_time.is_null() {
+        return epoch.to_string();
     }
+    let tm = unsafe { tm.assume_init() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }

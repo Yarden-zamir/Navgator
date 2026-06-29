@@ -8,15 +8,16 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Alignment,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::Text,
-    widgets::{Block, BorderType, Borders, List, ListState, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Clear, List, ListState, Paragraph, Wrap},
     Terminal,
 };
 use std::{
     collections::{HashMap, HashSet},
     env, io,
+    path::Path,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -42,17 +43,21 @@ use compositor::{CurrentCompositor, FocusChange, NavigationCompositor};
 use config::config_schema_json;
 use content::{
     apply_git_result, apply_github_readme_result, build_placeholder_text, build_preview_data,
-    ensure_git_for_preview,
+    build_remote_branch_preview_data, ensure_git_for_preview,
 };
 use github::ensure_github_readme_for_preview;
 use metadata::{ensure_dates_for_paths, spawn_bulk_metadata_fetch};
 use model::{
     AppResult, Focus, GitResult, GithubReadmeResult, HelpColors, HelpContext, MetaResult,
-    NavigateEntry, PreviewColors, PreviewData, PreviewResult, PreviewSettings, ResultUpdate,
-    SidePanelRender, SortMeta, SortMode, TagResult, VisibleListArgs, DATE_PLACEHOLDER,
+    NavigateEntry, NavigateEntryKind, PreviewColors, PreviewData, PreviewResult, PreviewSettings,
+    RemoteToggleState, ResultUpdate, SidePanelRender, SortMeta, SortMode, TagResult,
+    VisibleListArgs, DATE_PLACEHOLDER,
 };
 use navgator_core::{copy_to_clipboard, ensure_tty_stdin, write_selection};
-use results::{build_items, spawn_worktree_result_provider};
+use results::{
+    build_items, spawn_remote_branch_result_provider, spawn_worktree_result_provider,
+    REMOTE_BRANCH_PROVIDER_PREFIX,
+};
 use search::{filter_and_sort, index_for_entry_id, parse_query_tokens};
 use tags::{
     collect_tag_suggestions, commit_tag_input, ensure_tags_for_paths, read_tags_for_path,
@@ -93,6 +98,41 @@ fn print_config_schema() -> AppResult<()> {
     Ok(())
 }
 
+enum WorktreeProgress {
+    Message(String),
+    Select(String),
+    Deleted(String),
+    Error(String),
+}
+
+struct WorktreeOverlay {
+    title: String,
+    messages: Vec<String>,
+    error: Option<String>,
+}
+
+impl WorktreeOverlay {
+    fn new(title: String, first_message: &str) -> Self {
+        Self {
+            title,
+            messages: vec![first_message.to_string()],
+            error: None,
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn push_message(&mut self, message: String) {
+        self.messages.push(message);
+    }
+
+    fn fail(&mut self, message: String) {
+        self.error = Some(message);
+    }
+}
+
 fn run_navigate() -> AppResult<()> {
     let result = build_items()?;
     match select_from_list("Navigate", result.entries, result.preview_settings)? {
@@ -113,7 +153,7 @@ fn select_from_list(
     let (mut terminal, _guard) = setup_terminal()?;
     let mut input = Input::default();
     let mut selected = 0usize;
-    let mut sort_mode = SortMode::Match;
+    let mut sort_mode = SortMode::ModifiedDesc;
     let mut focus = Focus::Search;
     let mut meta_cache: HashMap<String, SortMeta> = HashMap::new();
     let mut list_offset = 0usize;
@@ -128,6 +168,7 @@ fn select_from_list(
     let (date_tx, date_rx) = mpsc::channel::<MetaResult>();
     let (tag_tx, tag_rx) = mpsc::channel::<TagResult>();
     let (result_tx, result_rx) = mpsc::channel::<ResultUpdate>();
+    let (worktree_tx, worktree_rx) = mpsc::channel::<WorktreeProgress>();
     let mut preview_cache: HashMap<String, PreviewData> = HashMap::new();
     let mut git_in_flight: HashSet<String> = HashSet::new();
     let mut github_in_flight: HashSet<String> = HashSet::new();
@@ -136,7 +177,22 @@ fn select_from_list(
     let mut tag_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut tag_in_flight: HashSet<String> = HashSet::new();
     let mut tag_scan_started = false;
-    let mut filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+    let mut show_remote_branches = false;
+    let mut remote_fetching = false;
+    let mut remote_error = false;
+    let mut remote_status: Option<String> = None;
+    let current_project_path = env::current_dir()
+        .ok()
+        .and_then(|path| git::git_worktree_root_for_path(&path));
+    let mut filtered = filter_and_sort_visible(
+        &entries,
+        input.value(),
+        sort_mode,
+        &meta_cache,
+        &tag_cache,
+        show_remote_branches,
+        current_project_path.as_deref(),
+    );
     let mut preview_path: Option<String> = None;
     let mut preview_entry_id: Option<String> = None;
     let mut in_flight: Option<String> = None;
@@ -152,7 +208,12 @@ fn select_from_list(
     let mut tag_edit_tags: Vec<String> = Vec::new();
     let mut tag_input = Input::default();
     let mut tag_suggestions: Vec<String> = Vec::new();
-    spawn_worktree_result_provider(&entries, result_tx);
+    let mut worktree_overlay: Option<WorktreeOverlay> = None;
+    spawn_worktree_result_provider(&entries, result_tx.clone());
+    if sort_mode.uses_time() {
+        let paths = all_metadata_paths(&entries);
+        spawn_bulk_metadata_fetch(&paths, &date_cache, &mut date_in_flight, &date_tx);
+    }
 
     loop {
         let current_entry = current_selection_entry(&entries, &filtered, selected).cloned();
@@ -161,6 +222,40 @@ fn select_from_list(
             .map(|entry| entry.preview_root_path.clone());
         let query_value = input.value();
         let tokens = parse_query_tokens(query_value);
+
+        while let Ok(progress) = worktree_rx.try_recv() {
+            match progress {
+                WorktreeProgress::Message(message) => {
+                    if let Some(overlay) = worktree_overlay.as_mut() {
+                        overlay.push_message(message);
+                    }
+                }
+                WorktreeProgress::Select(path) => {
+                    terminal.show_cursor()?;
+                    return Ok(Some(path));
+                }
+                WorktreeProgress::Deleted(path) => {
+                    entries.retain(|entry| entry.selection_path != path);
+                    filtered = filter_and_sort_visible(
+                        &entries,
+                        input.value(),
+                        sort_mode,
+                        &meta_cache,
+                        &tag_cache,
+                        show_remote_branches,
+                        current_project_path.as_deref(),
+                    );
+                    selected = adjust_selected_index(selected, filtered.len());
+                    preview_cache.remove(&path);
+                    worktree_overlay = None;
+                }
+                WorktreeProgress::Error(message) => {
+                    if let Some(overlay) = worktree_overlay.as_mut() {
+                        overlay.fail(message);
+                    }
+                }
+            }
+        }
 
         let mut entries_changed = false;
         while let Ok(update) = result_rx.try_recv() {
@@ -183,15 +278,29 @@ fn select_from_list(
                     entries_changed = true;
                 }
                 ResultUpdate::Status {
-                    provider_id: _,
-                    message: _,
-                } => {}
+                    provider_id,
+                    message,
+                } => {
+                    if provider_id == REMOTE_BRANCH_PROVIDER_PREFIX {
+                        remote_fetching = message.starts_with("refreshing ");
+                        remote_error = !remote_fetching && message != "remote branches loaded";
+                        remote_status = Some(message);
+                    }
+                }
             }
         }
 
         if entries_changed {
             let selected_id = current_entry.as_ref().map(|entry| entry.id.clone());
-            filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+            filtered = filter_and_sort_visible(
+                &entries,
+                input.value(),
+                sort_mode,
+                &meta_cache,
+                &tag_cache,
+                show_remote_branches,
+                current_project_path.as_deref(),
+            );
             selected = selected_id
                 .as_deref()
                 .and_then(|id| index_for_entry_id(&entries, &filtered, id))
@@ -304,7 +413,15 @@ fn select_from_list(
         if resort_needed {
             let selected_id = current_selection_entry(&entries, &filtered, selected)
                 .map(|entry| entry.id.clone());
-            filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+            filtered = filter_and_sort_visible(
+                &entries,
+                input.value(),
+                sort_mode,
+                &meta_cache,
+                &tag_cache,
+                show_remote_branches,
+                current_project_path.as_deref(),
+            );
             selected = match selected_id {
                 Some(id) => index_for_entry_id(&entries, &filtered, &id).unwrap_or(0),
                 None => adjust_selected_index(selected, filtered.len()),
@@ -314,7 +431,15 @@ fn select_from_list(
         if tags_changed && query_uses_tags {
             let selected_id = current_selection_entry(&entries, &filtered, selected)
                 .map(|entry| entry.id.clone());
-            filtered = filter_and_sort(&entries, input.value(), sort_mode, &meta_cache, &tag_cache);
+            filtered = filter_and_sort_visible(
+                &entries,
+                input.value(),
+                sort_mode,
+                &meta_cache,
+                &tag_cache,
+                show_remote_branches,
+                current_project_path.as_deref(),
+            );
             selected = match selected_id {
                 Some(id) => index_for_entry_id(&entries, &filtered, &id).unwrap_or(0),
                 None => adjust_selected_index(selected, filtered.len()),
@@ -368,7 +493,7 @@ fn select_from_list(
                         );
                     } else if in_flight.as_deref() != Some(path) {
                         let placeholder = build_placeholder_text(
-                            Some(path),
+                            preview_placeholder_path(current_entry.as_ref()),
                             accent,
                             muted,
                             text,
@@ -380,9 +505,11 @@ fn select_from_list(
                         in_flight = Some(path.to_string());
                         let tx = preview_tx.clone();
                         let path_owned = path.to_string();
+                        let entry_owned = current_entry.clone();
                         thread::spawn(move || {
-                            let data = build_preview_data(
+                            let data = build_preview_data_for_entry(
                                 &path_owned,
+                                entry_owned.as_ref(),
                                 accent,
                                 muted,
                                 text,
@@ -411,7 +538,31 @@ fn select_from_list(
             let list_area = ui.list_area;
             let detail_area = ui.detail_area;
 
-            let list_title = format!("Results {}/{}", filtered.len(), entries.len());
+            let remote_state =
+                remote_toggle_state(show_remote_branches, remote_fetching, remote_error);
+            let can_delete_worktree = current_entry
+                .as_ref()
+                .is_some_and(|entry| matches!(entry.kind, NavigateEntryKind::Worktree { .. }));
+            let list_title = if show_remote_branches {
+                match remote_status.as_deref() {
+                    Some(status) => format!(
+                        "Results {}/{} + remote {status}",
+                        filtered.len(),
+                        visible_entry_count(&entries, true)
+                    ),
+                    None => format!(
+                        "Results {}/{} + remote",
+                        filtered.len(),
+                        visible_entry_count(&entries, true)
+                    ),
+                }
+            } else {
+                format!(
+                    "Results {}/{}",
+                    filtered.len(),
+                    visible_entry_count(&entries, false)
+                )
+            };
             let left_title = if focus == Focus::Search {
                 format!("* {}", list_title)
             } else {
@@ -585,6 +736,8 @@ fn select_from_list(
                 HelpContext {
                     focus,
                     sort_mode,
+                    remote_state,
+                    can_delete_worktree,
                     show_detail,
                     cursor_at_end: input_at_end(&input),
                     has_tag_input: !tag_input.value().trim().is_empty(),
@@ -600,6 +753,7 @@ fn select_from_list(
                     text,
                     accent,
                     key_color,
+                    remote_color: warm,
                 },
             );
             let help = Paragraph::new(Text::from(help_line))
@@ -613,12 +767,25 @@ fn select_from_list(
                 .alignment(Alignment::Left)
                 .wrap(Wrap { trim: true });
             frame.render_widget(help, ui.help_area);
+
+            if let Some(overlay) = worktree_overlay.as_ref() {
+                render_worktree_overlay(frame, size.into(), overlay, accent, warm, text, muted);
+            }
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.code == KeyCode::Esc {
+                        if worktree_overlay.is_some() {
+                            if worktree_overlay
+                                .as_ref()
+                                .is_some_and(WorktreeOverlay::is_error)
+                            {
+                                worktree_overlay = None;
+                            }
+                            continue;
+                        }
                         terminal.show_cursor()?;
                         return Ok(None);
                     }
@@ -627,6 +794,16 @@ fn select_from_list(
                     {
                         terminal.show_cursor()?;
                         return Ok(None);
+                    }
+                    if worktree_overlay.is_some() {
+                        if key.code == KeyCode::Enter
+                            && worktree_overlay
+                                .as_ref()
+                                .is_some_and(WorktreeOverlay::is_error)
+                        {
+                            worktree_overlay = None;
+                        }
+                        continue;
                     }
                     if key.code == KeyCode::Char('y')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -640,6 +817,68 @@ fn select_from_list(
                         ) {
                             let _ = copy_to_clipboard(&value);
                         }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('d')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && focus != Focus::TagEdit
+                    {
+                        let Some(entry) = current_selection_entry(&entries, &filtered, selected)
+                            .filter(|entry| {
+                                matches!(entry.kind, NavigateEntryKind::Worktree { .. })
+                            })
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        worktree_overlay = Some(WorktreeOverlay::new(
+                            delete_worktree_overlay_title(&entry),
+                            "Starting safety checks",
+                        ));
+                        start_worktree_deletion(entry, worktree_tx.clone());
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('o')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && focus != Focus::TagEdit
+                    {
+                        let selected_id = current_selection_entry(&entries, &filtered, selected)
+                            .map(|entry| entry.id.clone());
+                        show_remote_branches = !show_remote_branches;
+                        remote_error = false;
+                        if show_remote_branches {
+                            if let Some(entry) =
+                                current_selection_entry(&entries, &filtered, selected).cloned()
+                            {
+                                remote_fetching = true;
+                                remote_status = Some("loading local remotes...".to_string());
+                                entries.retain(|entry| {
+                                    !entry.id.starts_with(REMOTE_BRANCH_PROVIDER_PREFIX)
+                                });
+                                spawn_remote_branch_result_provider(entry, result_tx.clone());
+                            } else {
+                                remote_fetching = false;
+                                remote_error = true;
+                                remote_status = Some("No repo selected".to_string());
+                            }
+                        } else {
+                            remote_fetching = false;
+                            remote_status = None;
+                        }
+                        filtered = filter_and_sort_visible(
+                            &entries,
+                            input.value(),
+                            sort_mode,
+                            &meta_cache,
+                            &tag_cache,
+                            show_remote_branches,
+                            current_project_path.as_deref(),
+                        );
+                        selected = selected_id
+                            .as_deref()
+                            .and_then(|id| index_for_entry_id(&entries, &filtered, id))
+                            .unwrap_or_else(|| adjust_selected_index(selected, filtered.len()));
+                        list_offset = 0;
                         continue;
                     }
                     if key.code == KeyCode::Char('t')
@@ -659,6 +898,17 @@ fn select_from_list(
                         continue;
                     }
                     if key.code == KeyCode::Enter && focus != Focus::TagEdit {
+                        if let Some(entry) = current_selection_entry(&entries, &filtered, selected)
+                            .filter(|entry| is_remote_branch_entry(entry))
+                            .cloned()
+                        {
+                            worktree_overlay = Some(WorktreeOverlay::new(
+                                worktree_overlay_title(&entry),
+                                "Starting worktree creation",
+                            ));
+                            start_remote_worktree_creation(entry, worktree_tx.clone());
+                            continue;
+                        }
                         let value = selection_path_for_action(
                             focus,
                             current.as_deref(),
@@ -675,12 +925,14 @@ fn select_from_list(
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         sort_mode = sort_mode.next();
-                        filtered = filter_and_sort(
+                        filtered = filter_and_sort_visible(
                             &entries,
                             input.value(),
                             sort_mode,
                             &meta_cache,
                             &tag_cache,
+                            show_remote_branches,
+                            current_project_path.as_deref(),
                         );
                         selected = 0;
                         list_offset = 0;
@@ -734,12 +986,14 @@ fn select_from_list(
                                     let _ = input.handle_event(&Event::Key(key));
                                 }
                                 if input.value() != before {
-                                    filtered = filter_and_sort(
+                                    filtered = filter_and_sort_visible(
                                         &entries,
                                         input.value(),
                                         sort_mode,
                                         &meta_cache,
                                         &tag_cache,
+                                        show_remote_branches,
+                                        current_project_path.as_deref(),
                                     );
                                     selected = 0;
                                     list_offset = 0;
@@ -764,12 +1018,14 @@ fn select_from_list(
                                 let selected_id =
                                     current_selection_entry(&entries, &filtered, selected)
                                         .map(|entry| entry.id.clone());
-                                filtered = filter_and_sort(
+                                filtered = filter_and_sort_visible(
                                     &entries,
                                     input.value(),
                                     sort_mode,
                                     &meta_cache,
                                     &tag_cache,
+                                    show_remote_branches,
+                                    current_project_path.as_deref(),
                                 );
                                 selected = match selected_id {
                                     Some(value) => {
@@ -812,12 +1068,14 @@ fn select_from_list(
                 Event::Paste(value) => match focus {
                     Focus::Search => {
                         insert_paste(&mut input, &value);
-                        filtered = filter_and_sort(
+                        filtered = filter_and_sort_visible(
                             &entries,
                             input.value(),
                             sort_mode,
                             &meta_cache,
                             &tag_cache,
+                            show_remote_branches,
+                            current_project_path.as_deref(),
                         );
                         selected = 0;
                         list_offset = 0;
@@ -894,6 +1152,269 @@ fn insert_paste(input: &mut Input, value: &str) {
     }
 }
 
+fn filter_and_sort_visible(
+    entries: &[NavigateEntry],
+    query: &str,
+    sort_mode: SortMode,
+    meta_cache: &HashMap<String, SortMeta>,
+    tag_cache: &HashMap<String, Vec<String>>,
+    show_remote_branches: bool,
+    pinned_path: Option<&str>,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = filter_and_sort(entries, query, sort_mode, meta_cache, tag_cache)
+        .into_iter()
+        .filter(|index| show_remote_branches || !is_remote_branch_entry(&entries[*index]))
+        .collect();
+    if query.trim().is_empty() {
+        pin_current_project(&mut indices, entries, pinned_path);
+    }
+    indices
+}
+
+fn pin_current_project(
+    indices: &mut Vec<usize>,
+    entries: &[NavigateEntry],
+    pinned_path: Option<&str>,
+) {
+    let Some(pinned_path) = pinned_path else {
+        return;
+    };
+    let Some(position) = indices
+        .iter()
+        .position(|index| entry_matches_path(&entries[*index], pinned_path))
+    else {
+        return;
+    };
+    let index = indices.remove(position);
+    indices.insert(0, index);
+}
+
+fn entry_matches_path(entry: &NavigateEntry, path: &str) -> bool {
+    entry.selection_path == path
+        || entry.metadata_path == path
+        || entry.preview_root_path == path
+        || entry.preferred_preview_path.as_deref() == Some(path)
+}
+
+fn visible_entry_count(entries: &[NavigateEntry], show_remote_branches: bool) -> usize {
+    entries
+        .iter()
+        .filter(|entry| show_remote_branches || !is_remote_branch_entry(entry))
+        .count()
+}
+
+fn is_remote_branch_entry(entry: &NavigateEntry) -> bool {
+    matches!(entry.kind, NavigateEntryKind::RemoteBranch { .. })
+}
+
+fn remote_toggle_state(
+    show_remote_branches: bool,
+    remote_fetching: bool,
+    remote_error: bool,
+) -> RemoteToggleState {
+    if remote_fetching {
+        RemoteToggleState::Fetching
+    } else if remote_error {
+        RemoteToggleState::Error
+    } else if show_remote_branches {
+        RemoteToggleState::Active
+    } else {
+        RemoteToggleState::Off
+    }
+}
+
+fn start_remote_worktree_creation(entry: NavigateEntry, tx: mpsc::Sender<WorktreeProgress>) {
+    thread::spawn(move || {
+        let NavigateEntryKind::RemoteBranch {
+            remote_branch,
+            bare_path,
+            container_path,
+            ..
+        } = entry.kind
+        else {
+            let _ = tx.send(WorktreeProgress::Error("not a remote branch".to_string()));
+            return;
+        };
+
+        let result = git::add_worktree_for_remote_with_progress(
+            Path::new(&bare_path),
+            Path::new(&container_path),
+            &remote_branch,
+            progress_sender(&tx),
+        );
+        match result {
+            Ok(path) => {
+                let _ = tx.send(WorktreeProgress::Select(path));
+            }
+            Err(message) => {
+                let _ = tx.send(WorktreeProgress::Error(message));
+            }
+        }
+    });
+}
+
+fn start_worktree_deletion(entry: NavigateEntry, tx: mpsc::Sender<WorktreeProgress>) {
+    thread::spawn(move || {
+        let path = entry.selection_path.clone();
+        let result =
+            git::remove_worktree_safely_with_progress(Path::new(&path), progress_sender(&tx));
+        match result {
+            Ok(path) => {
+                let _ = tx.send(WorktreeProgress::Deleted(path));
+            }
+            Err(message) => {
+                let _ = tx.send(WorktreeProgress::Error(message));
+            }
+        }
+    });
+}
+
+fn progress_sender(tx: &mpsc::Sender<WorktreeProgress>) -> impl FnMut(String) + '_ {
+    move |message| {
+        let _ = tx.send(WorktreeProgress::Message(message));
+    }
+}
+
+fn worktree_overlay_title(entry: &NavigateEntry) -> String {
+    if let NavigateEntryKind::RemoteBranch { remote_branch, .. } = &entry.kind {
+        format!("Creating {remote_branch}")
+    } else {
+        "Creating worktree".to_string()
+    }
+}
+
+fn delete_worktree_overlay_title(entry: &NavigateEntry) -> String {
+    if let NavigateEntryKind::Worktree { branch, .. } = &entry.kind {
+        format!("Deleting {branch}")
+    } else {
+        "Deleting worktree".to_string()
+    }
+}
+
+fn render_worktree_overlay(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    overlay: &WorktreeOverlay,
+    accent: Color,
+    warm: Color,
+    text: Color,
+    muted: Color,
+) {
+    let width = area.width.saturating_mul(2).saturating_div(3).clamp(48, 96);
+    let height = area
+        .height
+        .saturating_mul(2)
+        .saturating_div(5)
+        .clamp(11, 18);
+    let popup = centered_rect(area, width.min(area.width), height.min(area.height));
+    frame.render_widget(Clear, popup);
+
+    let border = if overlay.error.is_some() {
+        warm
+    } else {
+        accent
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(overlay.title.clone())
+        .border_style(Style::default().fg(border))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let progress_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 4.min(inner.height),
+    };
+    let progress = if overlay.error.is_some() {
+        1.0
+    } else {
+        (overlay.messages.len() as f64 / 5.0).clamp(0.08, 0.95)
+    };
+    let status = if overlay.error.is_some() {
+        "Failed"
+    } else {
+        "Working"
+    };
+    let current_step = overlay
+        .messages
+        .last()
+        .map(String::as_str)
+        .unwrap_or("Starting");
+    let progress_text = Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                status,
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(current_step.to_string(), Style::default().fg(text)),
+        ]),
+        render_progress_bar(progress, progress_area.width as usize, border, muted),
+    ]);
+    frame.render_widget(
+        Paragraph::new(progress_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {:>3}% ", (progress * 100.0).round() as u8))
+                    .border_style(Style::default().fg(border)),
+            )
+            .wrap(Wrap { trim: false }),
+        progress_area,
+    );
+
+    let messages_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(progress_area.height),
+        width: inner.width,
+        height: inner.height.saturating_sub(progress_area.height),
+    };
+    let max_messages = messages_area.height.saturating_sub(2) as usize;
+    let start = overlay.messages.len().saturating_sub(max_messages);
+    let mut lines = overlay.messages[start..].join("\n");
+    if let Some(error) = &overlay.error {
+        if !lines.is_empty() {
+            lines.push('\n');
+        }
+        lines.push_str(error);
+        lines.push_str("\n\nPress Enter or Esc to dismiss");
+    }
+    let messages = Paragraph::new(lines)
+        .style(Style::default().fg(if overlay.error.is_some() { warm } else { text }))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Messages")
+                .border_style(Style::default().fg(muted)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(messages, messages_area);
+}
+
+fn render_progress_bar(progress: f64, width: usize, fill: Color, empty: Color) -> Line<'static> {
+    let bar_width = width.saturating_sub(6).clamp(8, 72);
+    let filled = ((bar_width as f64) * progress).round() as usize;
+    let empty_count = bar_width.saturating_sub(filled);
+    Line::from(vec![
+        Span::styled("[", Style::default().fg(empty)),
+        Span::styled("█".repeat(filled), Style::default().fg(fill)),
+        Span::styled("░".repeat(empty_count), Style::default().fg(empty)),
+        Span::styled("]", Style::default().fg(empty)),
+    ])
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
 fn apply_preview_for_entry(
     compositor: &mut CurrentCompositor,
     data: &PreviewData,
@@ -902,6 +1423,47 @@ fn apply_preview_for_entry(
     compositor.apply_preview(data);
     if let Some(preferred_path) = entry.and_then(|entry| entry.preferred_preview_path.as_deref()) {
         compositor.select_preview_path(data, preferred_path);
+    }
+}
+
+fn build_preview_data_for_entry(
+    path: &str,
+    entry: Option<&NavigateEntry>,
+    accent: Color,
+    muted: Color,
+    text: Color,
+    preview_settings: PreviewSettings,
+) -> PreviewData {
+    if let Some(NavigateEntry {
+        kind:
+            NavigateEntryKind::RemoteBranch {
+                remote_branch,
+                bare_path,
+                ..
+            },
+        selection_path,
+        ..
+    }) = entry
+    {
+        return build_remote_branch_preview_data(
+            bare_path,
+            remote_branch,
+            selection_path,
+            accent,
+            muted,
+            text,
+        );
+    }
+
+    build_preview_data(path, accent, muted, text, preview_settings)
+}
+
+fn preview_placeholder_path(entry: Option<&NavigateEntry>) -> Option<&str> {
+    let entry = entry?;
+    if is_remote_branch_entry(entry) {
+        Some(entry.selection_path.as_str())
+    } else {
+        Some(entry.preview_root_path.as_str())
     }
 }
 
@@ -969,13 +1531,16 @@ fn selection_path_for_action(
     selected_entry: Option<&NavigateEntry>,
 ) -> Option<String> {
     enter_selection_path(focus, current_path, preview_tab_index, preview_cache).or_else(|| {
-        let selected_entry = selected_entry?;
-        preview_cache
-            .get(&selected_entry.preview_root_path)
-            .and_then(|data| data.previews.first())
-            .map(|tab| tab.path.clone())
-            .or_else(|| Some(selected_entry.selection_path.clone()))
+        selected_entry.map(|entry| match &entry.kind {
+            NavigateEntryKind::Project => selectable_project_path(entry),
+            _ => entry.selection_path.clone(),
+        })
     })
+}
+
+fn selectable_project_path(entry: &NavigateEntry) -> String {
+    git::selectable_worktree_path_for_project(Path::new(&entry.selection_path))
+        .unwrap_or_else(|| entry.selection_path.clone())
 }
 
 fn visible_paths_for_window(
@@ -1175,7 +1740,7 @@ mod tests {
                 Some(&selected_entry),
             )
             .as_deref(),
-            Some("/repos/project")
+            Some("/repos/project.git")
         );
     }
 

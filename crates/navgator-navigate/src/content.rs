@@ -14,7 +14,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
-use std::{collections::HashSet, env, fs, path::Path, sync::mpsc, thread};
+use std::{collections::HashSet, env, fs, path::Path, process::Command, sync::mpsc, thread};
 
 pub(crate) fn display_path_for_user(path: &str) -> String {
     match env::var("HOME") {
@@ -255,6 +255,53 @@ pub(crate) fn build_preview_data(
     }
 }
 
+pub(crate) fn build_remote_branch_preview_data(
+    bare_path: &str,
+    remote_branch: &str,
+    target_path: &str,
+    accent: Color,
+    muted: Color,
+    text: Color,
+) -> PreviewData {
+    let heading = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let value = Style::default().fg(text);
+    let subtle = Style::default().fg(muted);
+    let mut lines = vec![
+        Line::from(Span::styled("Remote branch", heading)),
+        Line::from(Span::styled(remote_branch.to_string(), value)),
+        Line::from(""),
+        Line::from(Span::styled("Target worktree", heading)),
+        Line::from(Span::styled(display_path_for_user(target_path), value)),
+    ];
+
+    if let Some(log_output) = run_git_dir_command_allow_empty(
+        Path::new(bare_path),
+        &["log", "-3", "--pretty=format:%s (%cr)", remote_branch],
+    ) {
+        if !log_output.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Recent commits", heading)));
+            lines.extend(lines_from_output(&log_output, value, 200));
+        }
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("No git summary available", subtle)));
+    }
+
+    PreviewData {
+        previews: vec![PreviewTab {
+            path: target_path.to_string(),
+            label: remote_branch.to_string(),
+            text: Text::from(lines),
+            git: None,
+            github_readme: None,
+        }],
+        selected_repo_is_bare: true,
+        git_loaded: true,
+        github_readme_loaded: true,
+    }
+}
+
 fn preview_targets_for_path(path: &str, shorten_worktree_tab_labels: bool) -> Vec<PreviewTarget> {
     let fallback = PreviewTarget {
         path: path.to_string(),
@@ -459,6 +506,26 @@ fn build_git_text_for_preview(
         return None;
     }
     Some(Text::from(lines))
+}
+
+fn run_git_dir_command_allow_empty(bare_path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(bare_path)
+        .arg("-c")
+        .arg("color.ui=never")
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string(),
+    )
 }
 
 fn build_path_lines(path: &str, value: Style) -> Vec<Line<'static>> {

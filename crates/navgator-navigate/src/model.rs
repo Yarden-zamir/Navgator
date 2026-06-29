@@ -266,6 +266,8 @@ pub(crate) enum Focus {
 pub(crate) struct HelpContext {
     pub(crate) focus: Focus,
     pub(crate) sort_mode: SortMode,
+    pub(crate) remote_state: RemoteToggleState,
+    pub(crate) can_delete_worktree: bool,
     pub(crate) show_detail: bool,
     pub(crate) cursor_at_end: bool,
     pub(crate) has_tag_input: bool,
@@ -283,6 +285,15 @@ pub(crate) struct HelpColors {
     pub(crate) text: Color,
     pub(crate) accent: Color,
     pub(crate) key_color: Color,
+    pub(crate) remote_color: Color,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteToggleState {
+    Off,
+    Fetching,
+    Active,
+    Error,
 }
 
 pub(crate) struct VisibleListArgs<'a> {
@@ -330,7 +341,17 @@ pub(crate) struct UiLayout {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) enum NavigateEntryKind {
     Project,
-    Worktree { repo_label: String, branch: String },
+    Worktree {
+        repo_label: String,
+        branch: String,
+    },
+    RemoteBranch {
+        repo_label: String,
+        branch: String,
+        remote_branch: String,
+        bare_path: String,
+        container_path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

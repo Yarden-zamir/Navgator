@@ -60,7 +60,8 @@ Tags render as colored pills in results and in the preview. Colors are determini
 
 Cycle with `Ctrl+S`:
 
-- `Match` (default)
+- `Modified v` (default)
+- `Match`
 - `A->Z` / `Z->A`
 - `Created ^` / `Created v`
 - `Modified ^` / `Modified v`
