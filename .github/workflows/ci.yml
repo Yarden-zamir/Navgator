@@ -1,0 +1,58 @@
+name: CI - tag and release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - README.md
+      - .github/ISSUE_TEMPLATE/**
+      - .github/PULL_REQUEST_TEMPLATE/**
+      - .github/dependabot.yml
+      - .github/FUNDING.yml
+      - .github/SECURITY.md
+      - LICENSE
+      - LICENSE.md
+
+jobs:
+  update:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Bump version and push tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.1
+        with:
+          github_token: ${{ secrets.TOKEN }}
+
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1.14.0
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+          token: ${{ secrets.TOKEN }}
+
+      - name: Release to Homebrew
+        run: |
+          brew tap yarden-zamir/tap https://${{ secrets.TOKEN }}@github.com/Yarden-zamir/homebrew-tap.git
+          brew trust --tap yarden-zamir/tap
+          brew bump-formula-pr \
+            --force \
+            --no-fork \
+            --no-browse \
+            --url=${{ github.event.repository.html_url }}/archive/refs/tags/${{ steps.tag_version.outputs.new_tag }}.tar.gz \
+            --sha256=$(curl -L ${{ github.event.repository.html_url }}/archive/refs/tags/${{ steps.tag_version.outputs.new_tag }}.tar.gz | shasum -a 256 | cut -d ' ' -f 1) \
+            --message="Update navgator to ${{ steps.tag_version.outputs.new_tag }}.    /auto-merge" \
+            navgator
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
