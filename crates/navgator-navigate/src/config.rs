@@ -1,4 +1,7 @@
-use crate::model::{default_preview_settings, AppResult, LoadedConfig, CONFIG_SCHEMA_URL};
+use crate::model::{
+    default_preview_settings, AppResult, LoadedConfig, RemoteSettings, SortMode, SortSettings,
+    ThemeColors, CONFIG_SCHEMA_URL,
+};
 use figment::providers::{Format, Toml};
 use figment::Figment;
 use schemars::{schema_for, JsonSchema};
@@ -7,6 +10,7 @@ use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -30,6 +34,18 @@ struct ConfigFile {
     #[serde(default)]
     #[schemars(title = "Preview", description = "Preview panel settings.")]
     preview: Option<ConfigPreview>,
+    #[serde(default)]
+    #[schemars(title = "Sort", description = "Result sorting settings.")]
+    sort: Option<ConfigSort>,
+    #[serde(default)]
+    #[schemars(title = "Remote", description = "Remote branch discovery settings.")]
+    remote: Option<ConfigRemote>,
+    #[serde(default)]
+    #[schemars(
+        title = "UI",
+        description = "User interface color and display settings."
+    )]
+    ui: Option<ConfigUi>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -78,6 +94,101 @@ struct ConfigPreview {
     selected_worktree_tab_min_chars: Option<usize>,
 }
 
+#[derive(Default, Deserialize, JsonSchema)]
+#[schemars(title = "Sort Settings", description = "Settings for result ordering.")]
+struct ConfigSort {
+    #[serde(default)]
+    #[schemars(
+        title = "Default Sort",
+        description = "Initial result sort mode. Defaults to modified-desc."
+    )]
+    default: Option<ConfigSortMode>,
+    #[serde(default)]
+    #[schemars(
+        title = "Pin Current Project",
+        description = "When true, the current Git worktree/project is pinned to the first row for empty searches. Defaults to true."
+    )]
+    pin_current_project: Option<bool>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+enum ConfigSortMode {
+    Match,
+    AlphaAsc,
+    AlphaDesc,
+    CreatedAsc,
+    CreatedDesc,
+    ModifiedAsc,
+    ModifiedDesc,
+}
+
+impl ConfigSortMode {
+    fn to_sort_mode(self) -> SortMode {
+        match self {
+            ConfigSortMode::Match => SortMode::Match,
+            ConfigSortMode::AlphaAsc => SortMode::AlphaAsc,
+            ConfigSortMode::AlphaDesc => SortMode::AlphaDesc,
+            ConfigSortMode::CreatedAsc => SortMode::CreatedAsc,
+            ConfigSortMode::CreatedDesc => SortMode::CreatedDesc,
+            ConfigSortMode::ModifiedAsc => SortMode::ModifiedAsc,
+            ConfigSortMode::ModifiedDesc => SortMode::ModifiedDesc,
+        }
+    }
+}
+
+#[derive(Default, Deserialize, JsonSchema)]
+#[schemars(
+    title = "Remote Settings",
+    description = "Settings for remote branch discovery and caching."
+)]
+struct ConfigRemote {
+    #[serde(default)]
+    #[schemars(
+        title = "Enabled By Default",
+        description = "When true, remote branch mode starts enabled for the initially selected project. Defaults to false."
+    )]
+    enabled_by_default: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        title = "Refresh On Toggle",
+        description = "When true, enabling remote branch mode runs a background ls-remote refresh. Defaults to true."
+    )]
+    refresh_on_toggle: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        title = "Use Cache",
+        description = "When true, cached remote branches are shown before local refs and background refresh. Defaults to true."
+    )]
+    use_cache: Option<bool>,
+}
+
+#[derive(Default, Deserialize, JsonSchema)]
+#[schemars(title = "UI Settings", description = "User interface color settings.")]
+struct ConfigUi {
+    #[serde(default)]
+    #[schemars(title = "Theme", description = "Color theme to use. Defaults to auto.")]
+    theme: Option<ConfigTheme>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+enum ConfigTheme {
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ConfigTheme {
+    fn colors(self) -> ThemeColors {
+        match self {
+            ConfigTheme::Auto => auto_theme_colors(),
+            ConfigTheme::Light => ThemeColors::light(),
+            ConfigTheme::Dark => ThemeColors::dark(),
+        }
+    }
+}
+
 pub(crate) fn config_schema_json() -> AppResult<String> {
     let schema = schema_for!(ConfigFile);
     serde_json::to_string_pretty(&schema)
@@ -91,6 +202,9 @@ pub(crate) fn load_config() -> AppResult<LoadedConfig> {
     let mut seen_index = HashSet::new();
     let mut seen_static = HashSet::new();
     let mut preview_settings = default_preview_settings();
+    let mut sort_settings = SortSettings::default();
+    let mut remote_settings = RemoteSettings::default();
+    let mut theme_colors = auto_theme_colors();
     let mut found_config = false;
 
     for path in config_paths(&home) {
@@ -131,16 +245,44 @@ pub(crate) fn load_config() -> AppResult<LoadedConfig> {
                 preview_settings.selected_worktree_tab_min_chars = value.max(1);
             }
         }
+        if let Some(sort) = config.sort {
+            if let Some(value) = sort.default {
+                sort_settings.default_mode = value.to_sort_mode();
+            }
+            if let Some(value) = sort.pin_current_project {
+                sort_settings.pin_current_project = value;
+            }
+        }
+        if let Some(remote) = config.remote {
+            if let Some(value) = remote.enabled_by_default {
+                remote_settings.enabled_by_default = value;
+            }
+            if let Some(value) = remote.refresh_on_toggle {
+                remote_settings.refresh_on_toggle = value;
+            }
+            if let Some(value) = remote.use_cache {
+                remote_settings.use_cache = value;
+            }
+        }
+        if let Some(ui) = config.ui {
+            if let Some(theme) = ui.theme {
+                theme_colors = theme.colors();
+            }
+        }
     }
 
     if !found_config {
-        return Err("No navgator config found. Create one in ~/.config/navgator/config.toml (or set $NAVGATOR_CONFIG).".into());
+        let path = create_default_config(&home)?;
+        return load_config_from_created_file(path);
     }
 
     Ok(LoadedConfig {
         index_folders,
         static_items,
         preview_settings,
+        sort_settings,
+        remote_settings,
+        theme_colors,
     })
 }
 
@@ -169,6 +311,100 @@ fn ensure_schema_link_in_config_file(path: &Path, config: &ConfigFile) {
 
     if updated != contents {
         let _ = fs::write(path, updated);
+    }
+}
+
+fn create_default_config(home: &Path) -> AppResult<PathBuf> {
+    let path = default_config_path(home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Failed to create config directory {}: {err}",
+                display_path_for_user(&parent.to_string_lossy())
+            )
+        })?;
+    }
+    fs::write(&path, default_config_contents()).map_err(|err| {
+        format!(
+            "Failed to create default config {}: {err}",
+            display_path_for_user(&path.to_string_lossy())
+        )
+    })?;
+    Ok(path)
+}
+
+fn load_config_from_created_file(_path: PathBuf) -> AppResult<LoadedConfig> {
+    load_config()
+}
+
+fn default_config_path(home: &Path) -> PathBuf {
+    if let Ok(path) = env::var("NAVGATOR_CONFIG") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    let xdg = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".config"));
+    xdg.join("navgator/config.toml")
+}
+
+fn default_config_contents() -> String {
+    format!(
+        r#""$schema" = "{CONFIG_SCHEMA_URL}"
+
+[paths]
+index_folders = ["~/Github", "~/Projects"]
+static_items = []
+
+[sort]
+default = "modified-desc"
+pin_current_project = true
+
+[remote]
+enabled_by_default = false
+refresh_on_toggle = true
+use_cache = true
+
+[ui]
+theme = "auto"
+
+[preview]
+shorten_worktree_tab_labels = true
+worktree_tab_min_chars = 6
+selected_worktree_tab_min_chars = 10
+"#
+    )
+}
+
+fn auto_theme_colors() -> ThemeColors {
+    if os_prefers_dark_theme() {
+        ThemeColors::dark()
+    } else {
+        ThemeColors::light()
+    }
+}
+
+fn os_prefers_dark_theme() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("defaults")
+            .arg("read")
+            .arg("-g")
+            .arg("AppleInterfaceStyle")
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .eq_ignore_ascii_case("Dark")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 

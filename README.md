@@ -24,14 +24,31 @@ Explore GitHub issues for the repo in the current folder:
 
 ## Zsh wrapper
 
+Load the wrapper in the current shell:
+
 ```
-source /Users/kcw/GitHub/navgator/scripts/navgator.zsh
+source scripts/navgator.zsh
 ```
 
-Bind example:
+The wrapper defines a Zsh widget named `navigate`. Bind it to a shortcut with `bindkey`. This example binds `Ctrl+T`:
 
 ```
 bindkey '^T' navigate
+```
+
+For a persistent shortcut, add both lines to your `~/.zshrc`:
+
+```
+source /path/to/navgator/scripts/navgator.zsh
+bindkey '^T' navigate
+```
+
+After restarting the shell, pressing `Ctrl+T` opens navgator. Selecting a row changes the current directory to the selected project or worktree.
+
+You can use another key sequence if `Ctrl+T` is already taken. For example, `Ctrl+G`:
+
+```
+bindkey '^G' navigate
 ```
 
 ## Search
@@ -95,7 +112,7 @@ Sorting by time triggers background metadata scans.
 
 ## Config
 
-No defaults are used. If no config is found, the app will exit and ask you to create one.
+If no config is found, navgator creates a default config at `$NAVGATOR_CONFIG` when set, otherwise at `$XDG_CONFIG_HOME/navgator/config.toml` or `~/.config/navgator/config.toml`.
 
 Config file search order (merge all found):
 
@@ -113,8 +130,20 @@ Config format (TOML):
 "$schema" = "https://raw.githubusercontent.com/Yarden-zamir/Navgator/main/config-schema.json"
 
 [paths]
-index_folders = ["/Users/kcw/Github", "/Users/kcw/Desktop"]
-static_items = ["/opt/homebrew", "/Users/kcw/Downloads"]
+index_folders = ["~/Github", "~/Projects"]
+static_items = ["~/Downloads"]
+
+[sort]
+default = "modified-desc"
+pin_current_project = true
+
+[remote]
+enabled_by_default = false
+refresh_on_toggle = true
+use_cache = true
+
+[ui]
+theme = "auto"
 
 [preview]
 shorten_worktree_tab_labels = true
@@ -126,6 +155,15 @@ If an existing config contains `[paths]` but no `"$schema"`, navgator prepends t
 
 `shorten_worktree_tab_labels` defaults to `true`; worktree branch labels like `feat/yarden/potato` render as `potato` in preview tabs. Set it to `false` to show full labels.
 `worktree_tab_min_chars` defaults to `6`; `selected_worktree_tab_min_chars` defaults to `10`. These control how many label characters are kept before `...` when worktree preview tabs must shrink.
+
+`[sort].default` accepts `match`, `alpha-asc`, `alpha-desc`, `created-asc`, `created-desc`, `modified-asc`, or `modified-desc`.
+`[sort].pin_current_project` keeps the current Git worktree/project as the first row for empty searches.
+
+`[remote].enabled_by_default` starts remote branch mode automatically.
+`[remote].refresh_on_toggle` controls whether enabling remote mode runs a background network refresh.
+`[remote].use_cache` controls whether cached remote branches are shown before local refs and refresh results.
+
+`[ui].theme` accepts `auto`, `light`, or `dark`. On macOS, `auto` follows the system appearance; on other platforms it currently falls back to `light`.
 
 Schema file is generated from the Rust config structs:
 

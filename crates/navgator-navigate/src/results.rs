@@ -5,7 +5,8 @@ use crate::git::{
     remote_branch_target_paths, RemoteBranchSummary,
 };
 use crate::model::{
-    AppResult, BuildItemsResult, GitWorktree, NavigateEntry, NavigateEntryKind, ResultUpdate,
+    AppResult, BuildItemsResult, GitWorktree, NavigateEntry, NavigateEntryKind, RemoteSettings,
+    ResultUpdate,
 };
 use crate::provider_runtime::{
     load_json_cache, save_json_cache, spawn_batched_jobs, unix_timestamp,
@@ -74,6 +75,9 @@ pub(crate) fn build_items() -> AppResult<BuildItemsResult> {
     Ok(BuildItemsResult {
         entries,
         preview_settings: config.preview_settings,
+        sort_settings: config.sort_settings,
+        remote_settings: config.remote_settings,
+        theme_colors: config.theme_colors,
     })
 }
 
@@ -90,6 +94,7 @@ pub(crate) fn spawn_worktree_result_provider(
 pub(crate) fn spawn_remote_branch_result_provider(
     entry: NavigateEntry,
     tx: mpsc::Sender<ResultUpdate>,
+    settings: RemoteSettings,
 ) {
     thread::spawn(move || {
         let Some((bare, container)) = dot_bare_for_path(Path::new(&entry.selection_path)) else {
@@ -106,16 +111,18 @@ pub(crate) fn spawn_remote_branch_result_provider(
 
         let repo_label = entry_name(&container.to_string_lossy());
         let summaries = remote_branch_summaries_for_bare(&bare);
-        send_remote_entries_if_any(
-            &tx,
-            remote_branch_entries_for_branches(
-                &repo_label,
-                &bare,
-                &container,
-                load_remote_branch_cache_for_bare(&bare),
-                &summaries,
-            ),
-        );
+        if settings.use_cache {
+            send_remote_entries_if_any(
+                &tx,
+                remote_branch_entries_for_branches(
+                    &repo_label,
+                    &bare,
+                    &container,
+                    load_remote_branch_cache_for_bare(&bare),
+                    &summaries,
+                ),
+            );
+        }
 
         send_remote_entries_if_any(
             &tx,
@@ -127,6 +134,10 @@ pub(crate) fn spawn_remote_branch_result_provider(
                 &summaries,
             ),
         );
+        if !settings.refresh_on_toggle {
+            send_remote_status(&tx, "remote branches loaded".to_string());
+            return;
+        }
         send_remote_status(&tx, format!("refreshing {repo_label}..."));
         let remote_branches = match ls_remote_heads(&bare) {
             Ok(branches) => branches,

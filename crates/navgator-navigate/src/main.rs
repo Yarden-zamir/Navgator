@@ -50,8 +50,8 @@ use metadata::{ensure_dates_for_paths, spawn_bulk_metadata_fetch};
 use model::{
     AppResult, Focus, GitResult, GithubReadmeResult, HelpColors, HelpContext, MetaResult,
     NavigateEntry, NavigateEntryKind, PreviewColors, PreviewData, PreviewResult, PreviewSettings,
-    RemoteToggleState, ResultUpdate, SidePanelRender, SortMeta, SortMode, TagResult,
-    VisibleListArgs, DATE_PLACEHOLDER,
+    RemoteSettings, RemoteToggleState, ResultUpdate, SidePanelRender, SortMeta, SortMode,
+    SortSettings, TagResult, ThemeColors, VisibleListArgs, DATE_PLACEHOLDER,
 };
 use navgator_core::{copy_to_clipboard, ensure_tty_stdin, write_selection};
 use results::{
@@ -135,7 +135,14 @@ impl WorktreeOverlay {
 
 fn run_navigate() -> AppResult<()> {
     let result = build_items()?;
-    match select_from_list("Navigate", result.entries, result.preview_settings)? {
+    match select_from_list(
+        "Navigate",
+        result.entries,
+        result.preview_settings,
+        result.sort_settings,
+        result.remote_settings,
+        result.theme_colors,
+    )? {
         Some(choice) => write_selection(&choice),
         None => std::process::exit(1),
     }
@@ -145,6 +152,9 @@ fn select_from_list(
     _title: &str,
     mut entries: Vec<NavigateEntry>,
     preview_settings: PreviewSettings,
+    sort_settings: SortSettings,
+    remote_settings: RemoteSettings,
+    theme_colors: ThemeColors,
 ) -> AppResult<Option<String>> {
     if entries.is_empty() {
         return Ok(None);
@@ -153,15 +163,15 @@ fn select_from_list(
     let (mut terminal, _guard) = setup_terminal()?;
     let mut input = Input::default();
     let mut selected = 0usize;
-    let mut sort_mode = SortMode::ModifiedDesc;
+    let mut sort_mode = sort_settings.default_mode;
     let mut focus = Focus::Search;
     let mut meta_cache: HashMap<String, SortMeta> = HashMap::new();
     let mut list_offset = 0usize;
-    let accent = Color::Rgb(72, 166, 255);
-    let warm = Color::Rgb(255, 181, 92);
-    let key_color = Color::Rgb(150, 150, 150);
-    let text = Color::Black;
-    let muted = text;
+    let accent = theme_colors.accent;
+    let warm = theme_colors.warm;
+    let key_color = theme_colors.key_color;
+    let text = theme_colors.text;
+    let muted = theme_colors.muted;
     let (preview_tx, preview_rx) = mpsc::channel::<PreviewResult>();
     let (git_tx, git_rx) = mpsc::channel::<GitResult>();
     let (github_tx, github_rx) = mpsc::channel::<GithubReadmeResult>();
@@ -177,8 +187,9 @@ fn select_from_list(
     let mut tag_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut tag_in_flight: HashSet<String> = HashSet::new();
     let mut tag_scan_started = false;
-    let mut show_remote_branches = false;
-    let mut remote_fetching = false;
+    let mut show_remote_branches = remote_settings.enabled_by_default;
+    let mut remote_fetching =
+        remote_settings.enabled_by_default && remote_settings.refresh_on_toggle;
     let mut remote_error = false;
     let mut remote_status: Option<String> = None;
     let current_project_path = env::current_dir()
@@ -191,7 +202,10 @@ fn select_from_list(
         &meta_cache,
         &tag_cache,
         show_remote_branches,
-        current_project_path.as_deref(),
+        pinned_path(
+            sort_settings.pin_current_project,
+            current_project_path.as_deref(),
+        ),
     );
     let mut preview_path: Option<String> = None;
     let mut preview_entry_id: Option<String> = None;
@@ -210,6 +224,16 @@ fn select_from_list(
     let mut tag_suggestions: Vec<String> = Vec::new();
     let mut worktree_overlay: Option<WorktreeOverlay> = None;
     spawn_worktree_result_provider(&entries, result_tx.clone());
+    if show_remote_branches {
+        if let Some(entry) = filtered
+            .first()
+            .and_then(|index| entries.get(*index))
+            .cloned()
+        {
+            remote_status = Some("loading local remotes...".to_string());
+            spawn_remote_branch_result_provider(entry, result_tx.clone(), remote_settings);
+        }
+    }
     if sort_mode.uses_time() {
         let paths = all_metadata_paths(&entries);
         spawn_bulk_metadata_fetch(&paths, &date_cache, &mut date_in_flight, &date_tx);
@@ -243,7 +267,10 @@ fn select_from_list(
                         &meta_cache,
                         &tag_cache,
                         show_remote_branches,
-                        current_project_path.as_deref(),
+                        pinned_path(
+                            sort_settings.pin_current_project,
+                            current_project_path.as_deref(),
+                        ),
                     );
                     selected = adjust_selected_index(selected, filtered.len());
                     preview_cache.remove(&path);
@@ -299,7 +326,10 @@ fn select_from_list(
                 &meta_cache,
                 &tag_cache,
                 show_remote_branches,
-                current_project_path.as_deref(),
+                pinned_path(
+                    sort_settings.pin_current_project,
+                    current_project_path.as_deref(),
+                ),
             );
             selected = selected_id
                 .as_deref()
@@ -420,7 +450,10 @@ fn select_from_list(
                 &meta_cache,
                 &tag_cache,
                 show_remote_branches,
-                current_project_path.as_deref(),
+                pinned_path(
+                    sort_settings.pin_current_project,
+                    current_project_path.as_deref(),
+                ),
             );
             selected = match selected_id {
                 Some(id) => index_for_entry_id(&entries, &filtered, &id).unwrap_or(0),
@@ -438,7 +471,10 @@ fn select_from_list(
                 &meta_cache,
                 &tag_cache,
                 show_remote_branches,
-                current_project_path.as_deref(),
+                pinned_path(
+                    sort_settings.pin_current_project,
+                    current_project_path.as_deref(),
+                ),
             );
             selected = match selected_id {
                 Some(id) => index_for_entry_id(&entries, &filtered, &id).unwrap_or(0),
@@ -850,12 +886,16 @@ fn select_from_list(
                             if let Some(entry) =
                                 current_selection_entry(&entries, &filtered, selected).cloned()
                             {
-                                remote_fetching = true;
+                                remote_fetching = remote_settings.refresh_on_toggle;
                                 remote_status = Some("loading local remotes...".to_string());
                                 entries.retain(|entry| {
                                     !entry.id.starts_with(REMOTE_BRANCH_PROVIDER_PREFIX)
                                 });
-                                spawn_remote_branch_result_provider(entry, result_tx.clone());
+                                spawn_remote_branch_result_provider(
+                                    entry,
+                                    result_tx.clone(),
+                                    remote_settings,
+                                );
                             } else {
                                 remote_fetching = false;
                                 remote_error = true;
@@ -872,7 +912,10 @@ fn select_from_list(
                             &meta_cache,
                             &tag_cache,
                             show_remote_branches,
-                            current_project_path.as_deref(),
+                            pinned_path(
+                                sort_settings.pin_current_project,
+                                current_project_path.as_deref(),
+                            ),
                         );
                         selected = selected_id
                             .as_deref()
@@ -932,7 +975,10 @@ fn select_from_list(
                             &meta_cache,
                             &tag_cache,
                             show_remote_branches,
-                            current_project_path.as_deref(),
+                            pinned_path(
+                                sort_settings.pin_current_project,
+                                current_project_path.as_deref(),
+                            ),
                         );
                         selected = 0;
                         list_offset = 0;
@@ -993,7 +1039,10 @@ fn select_from_list(
                                         &meta_cache,
                                         &tag_cache,
                                         show_remote_branches,
-                                        current_project_path.as_deref(),
+                                        pinned_path(
+                                            sort_settings.pin_current_project,
+                                            current_project_path.as_deref(),
+                                        ),
                                     );
                                     selected = 0;
                                     list_offset = 0;
@@ -1025,7 +1074,10 @@ fn select_from_list(
                                     &meta_cache,
                                     &tag_cache,
                                     show_remote_branches,
-                                    current_project_path.as_deref(),
+                                    pinned_path(
+                                        sort_settings.pin_current_project,
+                                        current_project_path.as_deref(),
+                                    ),
                                 );
                                 selected = match selected_id {
                                     Some(value) => {
@@ -1075,7 +1127,10 @@ fn select_from_list(
                             &meta_cache,
                             &tag_cache,
                             show_remote_branches,
-                            current_project_path.as_deref(),
+                            pinned_path(
+                                sort_settings.pin_current_project,
+                                current_project_path.as_deref(),
+                            ),
                         );
                         selected = 0;
                         list_offset = 0;
@@ -1187,6 +1242,14 @@ fn pin_current_project(
     };
     let index = indices.remove(position);
     indices.insert(0, index);
+}
+
+fn pinned_path(pin_current_project: bool, current_project_path: Option<&str>) -> Option<&str> {
+    if pin_current_project {
+        current_project_path
+    } else {
+        None
+    }
 }
 
 fn entry_matches_path(entry: &NavigateEntry, path: &str) -> bool {

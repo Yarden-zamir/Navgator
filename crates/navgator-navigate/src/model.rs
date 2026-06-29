@@ -185,6 +185,9 @@ pub(crate) struct DetailTab {
 pub(crate) struct BuildItemsResult {
     pub(crate) entries: Vec<NavigateEntry>,
     pub(crate) preview_settings: PreviewSettings,
+    pub(crate) sort_settings: SortSettings,
+    pub(crate) remote_settings: RemoteSettings,
+    pub(crate) theme_colors: ThemeColors,
 }
 
 pub(crate) enum ResultUpdate {
@@ -205,6 +208,72 @@ pub(crate) struct LoadedConfig {
     pub(crate) index_folders: Vec<PathBuf>,
     pub(crate) static_items: Vec<PathBuf>,
     pub(crate) preview_settings: PreviewSettings,
+    pub(crate) sort_settings: SortSettings,
+    pub(crate) remote_settings: RemoteSettings,
+    pub(crate) theme_colors: ThemeColors,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ThemeColors {
+    pub(crate) accent: Color,
+    pub(crate) warm: Color,
+    pub(crate) key_color: Color,
+    pub(crate) text: Color,
+    pub(crate) muted: Color,
+}
+
+impl ThemeColors {
+    pub(crate) fn light() -> Self {
+        Self {
+            accent: Color::Rgb(72, 166, 255),
+            warm: Color::Rgb(255, 181, 92),
+            key_color: Color::Rgb(150, 150, 150),
+            text: Color::Black,
+            muted: Color::Black,
+        }
+    }
+
+    pub(crate) fn dark() -> Self {
+        Self {
+            accent: Color::Rgb(99, 179, 237),
+            warm: Color::Rgb(251, 191, 36),
+            key_color: Color::Rgb(156, 163, 175),
+            text: Color::Rgb(229, 231, 235),
+            muted: Color::Rgb(156, 163, 175),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SortSettings {
+    pub(crate) default_mode: SortMode,
+    pub(crate) pin_current_project: bool,
+}
+
+impl Default for SortSettings {
+    fn default() -> Self {
+        Self {
+            default_mode: SortMode::ModifiedDesc,
+            pin_current_project: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RemoteSettings {
+    pub(crate) enabled_by_default: bool,
+    pub(crate) refresh_on_toggle: bool,
+    pub(crate) use_cache: bool,
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        Self {
+            enabled_by_default: false,
+            refresh_on_toggle: true,
+            use_cache: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
